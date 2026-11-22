@@ -48,6 +48,9 @@ pub const BIOME: &str = "biome";
 pub const PLANTS: &str = "plants";
 /// Live fire intensity (0..1) burning this step.
 pub const FIRE: &str = "fire";
+/// Live animal populations: r grazers, g predators (density, ~1 = what the best pasture
+/// feeds), b grass and a shrub cover eaten this step.
+pub const ANIMALS: &str = "animals";
 
 /// Bump when generation changes, so cached planets from older generators are not loaded.
 pub const GENERATOR_VERSION: &str = "planet-v1";
@@ -112,6 +115,8 @@ const GENERATION_FINALIZE: &str = "generation_finalize";
 const PLANTS_INIT: &str = "plants_init";
 const PLANTS_GROW: &str = "plants_grow";
 const FIRE_SPREAD: &str = "fire_spread";
+const ANIMALS_INIT: &str = "animals_init";
+const ANIMALS_STEP: &str = "animals_step";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
 #[repr(C)]
@@ -255,6 +260,52 @@ impl Default for PlantParams {
             subtropic_dryness: env.subtropic_dryness,
             lake_depth_m: env.lake_depth_m,
             _pad: [0.0; 2],
+        }
+    }
+}
+
+/// Mirrors `AnimalParams` in `shaders/planet/animal_params.wesl`, where the units are
+/// documented. One live step is about a month.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AnimalParams {
+    pub graze_rate: f32,
+    pub graze_half: f32,
+    pub grazer_gain: f32,
+    pub grazer_death: f32,
+    pub grazer_crowding: f32,
+    pub hunt_rate: f32,
+    pub hunt_half: f32,
+    pub predator_gain: f32,
+    pub predator_death: f32,
+    pub grazer_diffusion: f32,
+    pub grazer_taxis: f32,
+    pub predator_diffusion: f32,
+    pub predator_taxis: f32,
+    pub immigration: f32,
+    pub fire_kill: f32,
+    pub _pad: f32,
+}
+
+impl Default for AnimalParams {
+    fn default() -> Self {
+        Self {
+            graze_rate: 0.12,
+            graze_half: 0.2,
+            grazer_gain: 1.5,
+            grazer_death: 0.05,
+            grazer_crowding: 0.08,
+            hunt_rate: 0.25,
+            hunt_half: 0.3,
+            predator_gain: 0.3,
+            predator_death: 0.04,
+            grazer_diffusion: 0.04,
+            grazer_taxis: 0.15,
+            predator_diffusion: 0.06,
+            predator_taxis: 0.1,
+            immigration: 0.0005,
+            fire_kill: 0.5,
+            _pad: 0.0,
         }
     }
 }
@@ -406,6 +457,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
     let hydro = HydroParams::default();
     let env = EnvParams::default();
     let plants = PlantParams::default();
+    let animals = AnimalParams::default();
     let generate = |pass: SimPass| pass.phase(SimPhase::Generate);
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
@@ -418,6 +470,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         .add_field(BIOME, FieldFormat::R32Float)
         .add_field(PLANTS, FieldFormat::Rgba32Float)
         .add_field(FIRE, FieldFormat::R32Float)
+        .add_field(ANIMALS, FieldFormat::Rgba32Float)
         // Initial state.
         .add_pass(generate(
             SimPass::new(
@@ -536,6 +589,31 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         )
         .add_pass(
             SimPass::new(
+                ANIMALS_INIT,
+                "shaders/planet/animals_init.wesl",
+                "animals_init",
+            )
+            .read(BIOME)
+            .write(ANIMALS)
+            .trigger(PassTrigger::OnReset)
+            .with_params(animals),
+        )
+        // Animals feed first; plants_grow then takes what they ate off the cover.
+        .add_pass(
+            SimPass::new(
+                ANIMALS_STEP,
+                "shaders/planet/animals_step.wesl",
+                "animals_step",
+            )
+            .read(ANIMALS)
+            .read(PLANTS)
+            .read(FIRE)
+            .read(BIOME)
+            .write(ANIMALS)
+            .with_params(animals),
+        )
+        .add_pass(
+            SimPass::new(
                 PLANTS_GROW,
                 "shaders/planet/plants_grow.wesl",
                 "plants_grow",
@@ -545,6 +623,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .read(TEMPERATURE)
             .read(MOISTURE)
             .read(BIOME)
+            .read(ANIMALS)
             .write(PLANTS)
             .with_params(plants),
         )
