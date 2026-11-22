@@ -1,6 +1,7 @@
 //! The planet: declares its simulation fields and passes, and renders the result.
 
 pub mod camera;
+pub mod fauna;
 pub mod lod;
 pub mod mesh;
 pub mod sky;
@@ -349,6 +350,7 @@ impl Plugin for PlanetPlugin {
             MaterialPlugin::<VegetationMaterial>::default(),
         ))
         .init_resource::<Vegetation>()
+        .init_resource::<fauna::Fauna>()
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
             height_exaggeration: self.height_exaggeration,
@@ -366,6 +368,8 @@ impl Plugin for PlanetPlugin {
                 camera::clamp_camera.after(CameraControl),
                 lod::update_terrain.after(camera::clamp_camera),
                 vegetation::update_vegetation.after(camera::clamp_camera),
+                fauna::read_densities,
+                fauna::update_fauna.after(camera::clamp_camera),
                 camera::apply_floating_origin
                     .after(lod::update_terrain)
                     .after(vegetation::update_vegetation),
@@ -732,6 +736,11 @@ pub struct TerrainMaterial {
 impl Material for TerrainMaterial {
     fn vertex_shader() -> ShaderRef {
         "shaders/planet/planet_material.wesl".into()
+    }
+
+    // Terrain casts shadows (mountains, hills).
+    fn prepass_vertex_shader() -> ShaderRef {
+        "shaders/planet/terrain_prepass.wesl".into()
     }
 
     fn fragment_shader() -> ShaderRef {

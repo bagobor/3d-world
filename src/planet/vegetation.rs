@@ -666,18 +666,20 @@ pub fn update_vegetation(
         .filter_map(|(key, task)| block_on(poll_once(task)).map(|tile| (*key, tile)))
         .map(|(key, tile)| {
             let entity = tile.mesh.map(|mesh| {
-                commands
-                    .spawn((
-                        Name::new(format!("Vegetation {:?} {:?}", key.0, key.1)),
-                        Mesh3d(meshes.add(mesh)),
-                        MeshMaterial3d(planet.material.clone()),
-                        Transform::default(),
-                        Visibility::Hidden,
-                        NotShadowCaster,
-                        PlanetAnchor(tile.center),
-                        VegetationTile,
-                    ))
-                    .id()
+                let mut e = commands.spawn((
+                    Name::new(format!("Vegetation {:?} {:?}", key.0, key.1)),
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(planet.material.clone()),
+                    Transform::default(),
+                    Visibility::Hidden,
+                    PlanetAnchor(tile.center),
+                    VegetationTile,
+                ));
+                // Millions of blades: grass shadows aren't worth it.
+                if key.0 == Layer::Grass {
+                    e.insert(NotShadowCaster);
+                }
+                e.id()
             });
             veg.built.insert(
                 key,
@@ -831,12 +833,13 @@ impl Material for VegetationMaterial {
         "shaders/planet/vegetation.wesl".into()
     }
 
-    // The default prepass and shadow shaders would draw every plant at full size.
-    fn enable_prepass() -> bool {
-        false
+    // Plants cast shadows, grown in like in the main pass (see `vegetation_prepass.wesl`).
+    fn prepass_vertex_shader() -> ShaderRef {
+        "shaders/planet/vegetation_prepass.wesl".into()
     }
 
-    fn enable_shadows() -> bool {
+    // Only the shadow pass uses the prepass shader; the camera has no depth prepass.
+    fn enable_prepass() -> bool {
         false
     }
 

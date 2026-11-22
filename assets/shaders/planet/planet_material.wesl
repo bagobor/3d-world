@@ -14,6 +14,7 @@ import bevy_pbr::render::{
     pbr_functions as fns,
 };
 import bevy_core_pipeline::tonemapping::tone_mapping;
+import bevy_pbr::render::mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT;
 import super::super::sim::common::{dir_to_face, dir_to_face_st, neighbor_texel, gradient_noise};
 import super::cloud_field::cloud_coverage;
 
@@ -372,6 +373,8 @@ fn shade(
     pbr.material.reflectance = vec3(reflectance);
     pbr.material.perceptual_roughness = roughness;
     pbr.material.metallic = 0.0;
+    // Receive sun shadows (pbr_input_new clears the mesh flags).
+    pbr.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
     pbr.frag_coord = clip_position;
     pbr.world_position = world_position;
     pbr.world_normal = n;
