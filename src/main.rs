@@ -34,6 +34,7 @@ use planet_sim::{
     planet::{
         self, Biome, CameraControl, PlanetPlugin, camera,
         camera::PlanetCamera,
+        fauna::{Fauna, Species},
         lod::{LodSettings, TerrainLod},
         vegetation::Vegetation,
     },
@@ -117,7 +118,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow]"
+                         [--views planet,orbit,surface,forest,meadow,herd]"
                     );
                     std::process::exit(0);
                 }
@@ -313,6 +314,7 @@ fn headless_capture(
     target: Res<CaptureTarget>,
     lod: Res<TerrainLod>,
     vegetation: Res<Vegetation>,
+    fauna: Res<Fauna>,
     mut camera: ResMut<PlanetCamera>,
     mut control: ResMut<SimControl>,
     mut frames: Local<u64>,
@@ -379,14 +381,38 @@ fn headless_capture(
     };
     *camera = view;
     *wait += 1;
+    let fauna_ready = fauna.ready();
+    if name == "herd" && !done.herd_found {
+        // Wait for animals around the meadow, then stand back from the nearest herd.
+        if let (true, Some(herd)) = (fauna_ready, fauna.nearest_herd(camera.position())) {
+            let taken = done.taken;
+            let shot = &mut done.shots[taken].1;
+            shot.dir = herd;
+            shot.heading = 0.9;
+            shot.move_by(-30.0, 0.0);
+            shot.pitch = -0.1;
+            let ground = lod
+                .surface()
+                .map_or(0.0, |s| s.height(shot.dir, 1.0).max(0.0));
+            shot.altitude_m = ground + 2.5;
+            done.herd_found = true;
+            *wait = 0;
+        } else if *wait > 3_000 {
+            warn!("headless: no herd found near the meadow");
+            done.herd_found = true;
+        }
+        return;
+    }
     if done.retake {
         done.retake = false;
         take_screenshot(&mut commands, &target, &args, name);
-    } else if !done.shooting && *wait > 5 && lod.settled() && vegetation.settled() {
+    } else if !done.shooting && *wait > 5 && lod.settled() && vegetation.settled() && fauna_ready {
         info!(
-            "headless: {name} view, {} chunks, {} vegetation tiles",
+            "headless: {name} view, {} chunks, {} vegetation tiles, {} grazers, {} predators",
             lod.drawn(),
-            vegetation.drawn()
+            vegetation.drawn(),
+            fauna.count(Species::Grazer),
+            fauna.count(Species::Predator),
         );
         done.shooting = true;
         take_screenshot(&mut commands, &target, &args, name);
@@ -478,6 +504,8 @@ fn shots(
         ("surface", ground),
         ("forest", forest),
         ("meadow", meadow),
+        // Moved next to the nearest herd once animals are about.
+        ("herd", meadow),
     ]
 }
 
@@ -532,6 +560,8 @@ struct CaptureDone {
     screenshot_saved: bool,
     /// The last screenshot was blank (planet pipelines still compiling): take another.
     retake: bool,
+    /// The herd view has been moved next to a herd.
+    herd_found: bool,
     fields: Vec<(&'static str, FieldStats)>,
 }
 

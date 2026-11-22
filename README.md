@@ -16,6 +16,8 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|
 | ![forest](docs/forest.png) | ![meadow](docs/meadow.png) |
 
+![herd](docs/herd.png)
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -44,9 +46,13 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
   breed, die, migrate towards food and are killed by wildfire; grazing thins the plant
   cover.
 
+- Step 9: animals near the camera. Herds of grazers and packs of predators appear in
+  proportion to the live population densities; herds graze and keep together, flee from
+  predators, and predators hunt.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: animal rendering, lighting polish.
+Next: lighting polish.
 
 ## Running
 
@@ -71,7 +77,7 @@ Headless mode renders offscreen and saves five views, `planet.png` (whole planet
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
 view), `forest.png` (45 m over the nearest forest) and `meadow.png` (eye height in the
 nearest grassland), each once its terrain and vegetation have streamed in
-(`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
+plus `herd.png` (next to the nearest herd), (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
@@ -91,6 +97,7 @@ src/planet/       the planet: declares fields + passes, renders from them
   camera.rs       planet camera (f64) and floating origin
   sky.rs          atmosphere
   vegetation.rs   grass, shrub and tree tiles near the camera
+  fauna.rs        individual animals near the camera, from the population fields
 assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
@@ -205,8 +212,18 @@ habitable land (not water or ice), which is also what bounds their migration. Pe
    into good empty pasture.
 
 `plants_grow` then takes what was eaten off the plant cover, so heavy grazing keeps
-grasslands short and herds move on. These are populations, not individuals: the renderer
-(next step) will draw individual animals near the camera from these densities.
+grasslands short and herds move on. These are populations, not individuals; `planet/fauna.rs` draws individuals near the camera:
+
+- Every 5 s the `animals` field is read back to the CPU. Each ~300 m cell within 1.2 km
+  of the camera gets a herd (3 to 13 grazers) with a chance that grows with the local grazer
+  density, and a pack (2 to 4 predators) likewise; deterministic per cell. Cells beyond
+  1.7 km are dropped with their animals.
+- Behaviour on the CPU: grazers stand and graze, walk off now and then, keep within ~18 m of
+  their herd and bolt from predators within 70 m; predators roam as a pack, chase the
+  nearest grazer within 160 m (a little slower than a fleeing grazer), and stop for a while
+  to eat one they catch. Nobody walks into water.
+- Low-poly bodies from Bevy primitives, sized with some variety, with legs that swing in
+  diagonal pairs at a rate set by their speed.
 
 ### Level-of-detail terrain
 
