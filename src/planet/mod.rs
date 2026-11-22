@@ -3,6 +3,7 @@
 pub mod camera;
 pub mod lod;
 pub mod mesh;
+pub mod sky;
 pub mod surface;
 
 use bevy::{
@@ -291,6 +292,7 @@ impl Plugin for PlanetPlugin {
         app.add_plugins((
             MaterialPlugin::<PlanetMaterial>::default(),
             MaterialPlugin::<TerrainMaterial>::default(),
+            MaterialPlugin::<CloudMaterial>::default(),
         ))
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
@@ -298,17 +300,19 @@ impl Plugin for PlanetPlugin {
         })
         .insert_resource(TerrainLod::new(self.terrain))
         .insert_resource(PlanetCamera::new(radius))
-        .add_systems(Startup, declare_simulation)
+        .add_systems(Startup, (declare_simulation, sky::spawn_atmosphere))
         .add_systems(PostStartup, spawn_planet.after(SimAllocate))
         .add_systems(
             Update,
             (
                 toggle_biome_view,
+                show_clouds,
                 load_terrain_surface,
                 camera::clamp_camera.after(CameraControl),
                 lod::update_terrain.after(camera::clamp_camera),
                 camera::apply_floating_origin.after(lod::update_terrain),
                 swap_preview_for_terrain.after(lod::update_terrain),
+                sky::adapt_atmosphere.after(camera::clamp_camera),
             ),
         );
     }
@@ -557,6 +561,8 @@ pub struct PlanetMaterial {
     pub plants: Handle<Image>,
     #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub fire: Handle<Image>,
+    #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -614,6 +620,8 @@ pub struct TerrainMaterial {
     pub plants: Handle<Image>,
     #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub fire: Handle<Image>,
+    #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
 }
 
 impl Material for TerrainMaterial {
@@ -647,6 +655,75 @@ impl Material for TerrainMaterial {
     }
 }
 
+/// Height of the cloud layer above sea level, in metres.
+pub const CLOUD_HEIGHT_M: f32 = 6_000.0;
+
+/// A thin cloud shell around the planet. Coverage is procedural, shaped by latitude bands
+/// and the baked moisture map, and drifts slowly; the same function shades cloud shadows on
+/// the ground (see `shaders/planet/cloud_field.wesl`).
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct CloudMaterial {
+    #[uniform(0)]
+    pub params: CloudParams,
+    #[texture(1, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
+}
+
+#[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
+pub struct CloudParams {
+    pub planet_radius_m: f32,
+    pub cloud_height_m: f32,
+    pub resolution: f32,
+    /// 0 hides the clouds (while generating, before moisture exists).
+    pub visible: f32,
+}
+
+impl Material for CloudMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/planet/clouds.wesl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/planet/clouds.wesl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Seen from above and from below.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// The cloud shell: shown once the planet is live.
+#[derive(Component)]
+struct CloudShell;
+
+fn show_clouds(
+    stats: Res<crate::sim::SimStats>,
+    shells: Query<&MeshMaterial3d<CloudMaterial>, With<CloudShell>>,
+    mut materials: ResMut<Assets<CloudMaterial>>,
+) {
+    let visible = if stats.live() { 1.0 } else { 0.0 };
+    for handle in &shells {
+        if materials
+            .get(&handle.0)
+            .is_some_and(|m| m.params.visible != visible)
+            && let Some(mut m) = materials.get_mut(&handle.0)
+        {
+            m.params.visible = visible;
+        }
+    }
+}
+
 fn spawn_planet(
     mut commands: Commands,
     config: Res<PlanetConfig>,
@@ -655,7 +732,27 @@ fn spawn_planet(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PlanetMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut cloud_materials: ResMut<Assets<CloudMaterial>>,
 ) {
+    let radius = TerrainParams::default().planet_radius_m;
+    let clouds = cloud_materials.add(CloudMaterial {
+        params: CloudParams {
+            planet_radius_m: radius,
+            cloud_height_m: CLOUD_HEIGHT_M,
+            resolution: graph.resolution as f32,
+            visible: 0.0,
+        },
+        moisture: fields.front(MOISTURE),
+    });
+    commands.spawn((
+        Name::new("Clouds"),
+        Mesh3d(meshes.add(mesh::cube_sphere(192))),
+        MeshMaterial3d(clouds),
+        NotShadowCaster,
+        Transform::from_scale(Vec3::splat(radius + CLOUD_HEIGHT_M)),
+        PlanetAnchor(DVec3::ZERO),
+        CloudShell,
+    ));
     let terrain = terrain_materials.add(TerrainMaterial {
         height: fields.front(HEIGHT),
         water: fields.front(WATER),
@@ -664,6 +761,7 @@ fn spawn_planet(
         biome: fields.front(BIOME),
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
+        moisture: fields.front(MOISTURE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: 1.0,
@@ -681,6 +779,7 @@ fn spawn_planet(
         biome: fields.front(BIOME),
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
+        moisture: fields.front(MOISTURE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,

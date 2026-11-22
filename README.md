@@ -29,9 +29,13 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 - Step 5: level-of-detail terrain. A quadtree of chunks per cube face streams in detail
   around the camera, from the whole planet down to eye height, with a floating origin.
 
+- Step 6: atmosphere, ocean and clouds. Physically based sky and aerial perspective from the
+  ground to orbit, a shaded ocean with waves and surf, and a drifting cloud layer that casts
+  shadows.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: atmosphere and ocean, vegetation and animal rendering, animals.
+Next: vegetation and animal rendering, animals, lighting polish.
 
 ## Running
 
@@ -184,6 +188,23 @@ is baked, the baked fields are copied to the CPU and the planet is drawn as LOD 
   precision is never a problem, from 20 radii out to 1.8 m above the ground.
 - **Shading**: the same field-driven colours as before; up close, noise breaks the 20 km
   plant cover into groves and clearings, and octaves smaller than a few pixels fade out.
+
+### Atmosphere, ocean and clouds
+
+- **Sky** (`planet/sky.rs`): Bevy's atmosphere (Hillaire 2020), an Earth-like scattering
+  medium 100 km deep, centred on the planet and moved by the floating origin like everything
+  else. Below 30 km it uses lookup textures; above, raymarching, which holds up from orbit.
+  The aerial-perspective range grows with the distance to the horizon. The camera renders in
+  HDR with physical units (100 klx sun, `Exposure::SUNLIGHT`), and the atmosphere also
+  provides the environment light, so shadows are sky-blue and the ocean reflects the sky.
+- **Ocean**: colour by depth (green shallows, deep blue offshore), surf where it is under a
+  few metres deep, and moving wave normals from a few noise octaves. Octaves smaller than a
+  few pixels fade out and turn into roughness, so the sun glint widens with distance.
+- **Clouds**: a shell 6 km up with procedural cover (`cloud_field.wesl`): warped fractal noise
+  shaped by latitude bands (wet equator, clear subtropics, stormy mid-latitudes) and the
+  baked moisture map, drifting slowly. It is not a weather simulation. The terrain shader
+  evaluates the same function where the ray to the sun crosses the cloud layer, which gives
+  cloud shadows.
 
 ### Hydraulic erosion
 
