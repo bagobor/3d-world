@@ -53,20 +53,31 @@ cargo run --release -- --headless --out out  # no window: writes out/planet.png
 cargo run --release -- --seed 3 --regenerate  # ignore the cached planet, generate again
 ```
 
-Mouse: **left-drag** moves over the planet, **right-drag** looks around, **scroll** changes
-altitude (from 20 planet radii down to eye height). Keys: **WASD** fly (**Shift** faster),
-**Space** pause, **R** generate a new planet (next seed), **Up/Down** live simulation steps
-per frame.
+Camera modes, switched with **1 / 2 / 3**:
+
+- **1 Orbit** (default): **left-drag** moves over the planet, **right-drag** looks around,
+  **scroll** changes altitude (from 20 planet radii down to eye height), **WASD** moves
+  (**Shift** faster).
+- **2 Fly**: free flight. **Left-click** captures the mouse for looking around (**Esc**
+  releases it; **right-drag** also looks). **WASD** flies along the view, **E/Q** up and
+  down, **Shift** faster, **scroll** sets the speed. Speed grows with height above the
+  ground, from 15 m/s near it to hundreds of km/s in space.
+- **3 Walk**: on foot at 1.7 m eye height, following the terrain (on the ocean, on its
+  surface). Mouse look as in fly mode, **WASD** walks, **Shift** runs, **Space** jumps.
+
+Other keys: **Space** (or **P**; only **P** while walking) pauses the simulation, **R**
+generates a new planet (next seed), **Up/Down** live simulation steps per frame.
 
 The first start with a given seed and resolution generates the planet
 (`--generation-steps`, default 3000) and writes it to `cache/planet-v1-seed<seed>-res<res>.bin`
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves five views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves seven views, `planet.png` (whole planet),
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
-view), `forest.png` (45 m over the nearest forest) and `meadow.png` (eye height in the
-nearest grassland), each once its terrain and vegetation have streamed in
+view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
+nearest grassland), `fly.png` (fly mode, 600 m up) and `walk.png` (walk mode, eye height),
+each once its terrain and vegetation have streamed in
 (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
