@@ -201,16 +201,20 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
         },
         Transform::from_xyz(4.0, 1.5, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // Physical units: full sunlight and a daylight exposure; ambient stands in for skylight.
+    // Physical units: full sunlight and a daylight exposure. Skylight comes from the
+    // atmosphere's environment map; a little ambient keeps the night side from going black.
     commands.insert_resource(GlobalAmbientLight {
-        brightness: 6_000.0,
+        brightness: 300.0,
         ..default()
     });
 
     // The render camera stays at the origin (floating origin, see `planet::camera`).
     let mut camera = commands.spawn((
         Camera3d::default(),
+        bevy::camera::Hdr,
         bevy::camera::Exposure::SUNLIGHT,
+        bevy::pbr::AtmosphereSettings::default(),
+        bevy::light::AtmosphereEnvironmentMapLight::default(),
         Projection::Perspective(PerspectiveProjection {
             near: 0.3,
             far: 1.0e9,
