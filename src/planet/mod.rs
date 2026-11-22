@@ -5,6 +5,7 @@ pub mod lod;
 pub mod mesh;
 pub mod sky;
 pub mod surface;
+pub mod vegetation;
 
 use bevy::{
     light::NotShadowCaster,
@@ -25,6 +26,7 @@ use crate::sim::{
 use camera::{PlanetAnchor, PlanetCamera};
 use lod::{LodSettings, TerrainLod};
 use surface::{CubeField, DetailParams, PlanetSurface};
+use vegetation::{Vegetation, VegetationMaps, VegetationMaterial, VegetationParams};
 
 /// Terrain height in metres above the sea-level datum.
 pub const HEIGHT: &str = "height";
@@ -293,7 +295,9 @@ impl Plugin for PlanetPlugin {
             MaterialPlugin::<PlanetMaterial>::default(),
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<CloudMaterial>::default(),
+            MaterialPlugin::<VegetationMaterial>::default(),
         ))
+        .init_resource::<Vegetation>()
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
             height_exaggeration: self.height_exaggeration,
@@ -310,7 +314,10 @@ impl Plugin for PlanetPlugin {
                 load_terrain_surface,
                 camera::clamp_camera.after(CameraControl),
                 lod::update_terrain.after(camera::clamp_camera),
-                camera::apply_floating_origin.after(lod::update_terrain),
+                vegetation::update_vegetation.after(camera::clamp_camera),
+                camera::apply_floating_origin
+                    .after(lod::update_terrain)
+                    .after(vegetation::update_vegetation),
                 swap_preview_for_terrain.after(lod::update_terrain),
                 sky::adapt_atmosphere.after(camera::clamp_camera),
             ),
@@ -322,6 +329,10 @@ impl Plugin for PlanetPlugin {
 #[derive(Resource)]
 struct TerrainMaterialHandle(Handle<TerrainMaterial>);
 
+/// The vegetation material, shared by every vegetation tile.
+#[derive(Resource)]
+struct VegetationMaterialHandle(Handle<VegetationMaterial>);
+
 /// The GPU-displaced sphere shown while the planet is generating.
 #[derive(Component)]
 struct GenerationPreview;
@@ -332,10 +343,14 @@ fn load_terrain_surface(
     baked: Res<BakedFields>,
     control: Res<SimControl>,
     material: Option<Res<TerrainMaterialHandle>>,
+    vegetation_material: Option<Res<VegetationMaterialHandle>>,
     mut lod: ResMut<TerrainLod>,
+    mut vegetation: ResMut<Vegetation>,
     mut loaded: Local<u64>,
 ) {
-    let Some(material) = material else { return };
+    let (Some(material), Some(vegetation_material)) = (material, vegetation_material) else {
+        return;
+    };
     if !baked.ready() || baked.version == *loaded {
         return;
     }
@@ -354,6 +369,17 @@ fn load_terrain_surface(
     };
     info!("terrain: new planet surface (seed {})", baked.seed);
     lod.set_surface(&mut commands, surface, material.0.clone());
+    match (baked.f32_field(BIOME), baked.f32_field(TEMPERATURE)) {
+        (Some(biome), Some(temperature)) => vegetation.set_planet(
+            &mut commands,
+            lod.surface().unwrap().clone(),
+            VegetationMaps::new(baked.resolution, &biome, temperature),
+            vegetation_material.0.clone(),
+            lod.settings.exaggeration,
+            control.seed,
+        ),
+        _ => error!("vegetation: the baked planet has no biome or temperature map"),
+    }
 }
 
 /// Show the LOD terrain once it has something to draw; until then, the preview sphere.
@@ -733,8 +759,16 @@ fn spawn_planet(
     mut materials: ResMut<Assets<PlanetMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut cloud_materials: ResMut<Assets<CloudMaterial>>,
+    mut vegetation_materials: ResMut<Assets<VegetationMaterial>>,
 ) {
     let radius = TerrainParams::default().planet_radius_m;
+    let vegetation = vegetation_materials.add(VegetationMaterial {
+        params: VegetationParams::new(radius, graph.resolution as f32),
+        plants: fields.front(PLANTS),
+        temperature: fields.front(TEMPERATURE),
+        moisture: fields.front(MOISTURE),
+    });
+    commands.insert_resource(VegetationMaterialHandle(vegetation));
     let clouds = cloud_materials.add(CloudMaterial {
         params: CloudParams {
             planet_radius_m: radius,

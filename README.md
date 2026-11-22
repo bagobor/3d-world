@@ -12,6 +12,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|
 | ![orbit](docs/orbit.png) | ![surface](docs/surface.png) |
 
+| over a forest | in a meadow |
+|---|---|
+| ![forest](docs/forest.png) | ![meadow](docs/meadow.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -33,9 +37,12 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
   ground to orbit, a shaded ocean with waves and surf, and a drifting cloud layer that casts
   shadows.
 
+- Step 7: vegetation. Grass, shrubs and trees as real geometry near the camera, placed per
+  biome and grown in by the live ecosystem, so forests spread and burn on screen.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: vegetation and animal rendering, animals, lighting polish.
+Next: animals (simulation, then rendering), lighting polish.
 
 ## Running
 
@@ -56,9 +63,11 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves three views, `planet.png` (whole planet),
-`orbit.png` (low orbit) and `surface.png` (40 m above hilly land near the middle of the first
-view), each once its terrain detail has streamed in, plus `stats.txt` (min/max/mean of every
+Headless mode renders offscreen and saves five views, `planet.png` (whole planet),
+`orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
+view), `forest.png` (45 m over the nearest forest) and `meadow.png` (eye height in the
+nearest grassland), each once its terrain and vegetation have streamed in
+(`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
@@ -76,6 +85,8 @@ src/planet/       the planet: declares fields + passes, renders from them
   surface.rs      CPU surface: bicubic baked height + procedural detail, in f64
   lod.rs          quadtree LOD terrain chunks
   camera.rs       planet camera (f64) and floating origin
+  sky.rs          atmosphere
+  vegetation.rs   grass, shrub and tree tiles near the camera
 assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
@@ -83,6 +94,8 @@ assets/shaders/
   planet/moisture_spread.wesl, generation_finalize.wesl   environment maps + biomes
   planet/plants_*.wesl, fire_spread.wesl                  live plant ecosystem
   planet/planet_material.wesl   displaces + shades the planet from the height field
+  planet/clouds.wesl, cloud_field.wesl                    cloud shell and cloud shadows
+  planet/vegetation.wesl        grows, sways and shades vegetation
 ```
 
 ## The simulation framework
@@ -205,6 +218,30 @@ is baked, the baked fields are copied to the CPU and the planet is drawn as LOD 
   baked moisture map, drifting slowly. It is not a weather simulation. The terrain shader
   evaluates the same function where the ray to the sun crosses the cloud layer, which gives
   cloud shadows.
+
+### Vegetation
+
+`planet/vegetation.rs` draws plants as meshes in tiles of the terrain quadtree, one fixed
+level per layer:
+
+| layer | tile | spacing | drawn to |
+|---|---|---|---|
+| grass (clumps of 5 blades) | ~38 m | 0.45 m | 45 m |
+| shrubs | ~150 m | 4 m | 600 m |
+| trees, detailed (trunk + crown) | ~300 m | 11 m | 700 m |
+| trees, far (one cone or blob) | ~1.2 km | 11 m | 3 km |
+
+- **Placement (CPU)**: a jittered grid that is global to each cube face, so near and far tree
+  tiles put every tree in the same place. Each plant gets a random cover threshold; plants
+  whose biome can never reach that cover, those under water and trees on cliffs are skipped.
+  Conifers win where it is cold. Tiles build on the async task pool like terrain chunks.
+- **Growth (GPU)**: the vertex shader reads the live `plants` field and scales each plant in
+  where its type's cover exceeds its threshold. The drawn density follows the simulation:
+  burnt forest disappears and regrows as the ecosystem recovers. Trees switch from detailed
+  to far meshes at 700 m, and every layer shrinks away towards the end of its range,
+  where the terrain colour (which already shows plant cover) takes over.
+- **Shading**: colour by type, temperature and dryness, darker inside canopies, wind sway that
+  bends tall parts most, PBR lighting and cloud shadows. No shadow maps yet.
 
 ### Hydraulic erosion
 
