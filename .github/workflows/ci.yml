@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies (Bevy + Mesa software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
+            mesa-vulkan-drivers libvulkan1
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # Compiles every compute and material shader, runs the simulation on a CPU Vulkan
+      # driver (lavapipe), and checks the result.
+      - name: Headless simulation smoke test
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run -- --headless --steps 64 --steps-per-frame 16 --resolution 256 --out out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: headless-output
+          path: out/
