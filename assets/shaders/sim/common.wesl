@@ -140,3 +140,55 @@ fn gradient_noise(p: vec3<f32>, seed: u32) -> f32 {
     let x1 = mix(mix(n[4], n[5], u.x), mix(n[6], n[7], u.x), u.y);
     return mix(x0, x1, u.z) * 1.6;
 }
+
+// ---------------------------------------------------------------------------------------
+// 4-neighbour stencils across cube edges
+//
+// Direction k indexes (+x, -x, +y, -y) in the texel's own face. Per-direction data (e.g. a
+// flux to each neighbour, stored as a vec4) is in the owner's face frame, and faces are
+// rotated relative to each other, so "the neighbour's flux towards me" is not always the
+// opposite slot. `reverse_direction` finds the right one.
+
+fn neighbor_offset(k: u32) -> vec2<i32> {
+    switch k {
+        case 0u: { return vec2(1, 0); }
+        case 1u: { return vec2(-1, 0); }
+        case 2u: { return vec2(0, 1); }
+        default: { return vec2(0, -1); }
+    }
+}
+
+fn neighbor4(texel: vec3<u32>, k: u32, res: u32) -> vec3<u32> {
+    return neighbor_texel(texel, neighbor_offset(k), res);
+}
+
+// Direction index j such that neighbor4(n, j) == texel, where n = neighbor4(texel, k).
+fn reverse_direction(texel: vec3<u32>, k: u32, res: u32) -> u32 {
+    let n = neighbor4(texel, k, res);
+    if n.z == texel.z {
+        return k ^ 1u;
+    }
+    for (var j = 0u; j < 4u; j++) {
+        if all(neighbor4(n, j, res) == texel) {
+            return j;
+        }
+    }
+    // Unreachable on a well-formed cube sphere; fall back to the in-face answer.
+    return k ^ 1u;
+}
+
+fn vec4_at(v: vec4<f32>, k: u32) -> f32 {
+    switch k {
+        case 0u: { return v.x; }
+        case 1u: { return v.y; }
+        case 2u: { return v.z; }
+        default: { return v.w; }
+    }
+}
+
+// Great-circle-ish distance between two texel centres on a sphere of `radius`.
+fn texel_distance(a: vec3<u32>, b: vec3<u32>, inv_res: f32, radius: f32) -> f32 {
+    let da = texel_to_dir(a.z, vec2<f32>(a.xy) + 0.5, inv_res);
+    let db = texel_to_dir(b.z, vec2<f32>(b.xy) + 0.5, inv_res);
+    return radius * length(da - db);
+}

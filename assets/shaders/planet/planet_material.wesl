@@ -16,18 +16,33 @@ struct PlanetMaterialParams {
     planet_radius_m: f32,
     height_exaggeration: f32,
     resolution: f32,
-    _pad: f32,
+    river_discharge: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var height_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var<uniform> material: PlanetMaterialParams;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var water_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var discharge_tex: texture_2d_array<f32>;
 
-fn load_height(t: vec3<u32>) -> f32 {
-    return textureLoad(height_tex, vec2<i32>(t.xy), i32(t.z), 0).r;
+fn load_field(field: u32, t: vec3<u32>) -> f32 {
+    let p = vec2<i32>(t.xy);
+    switch field {
+        case 1u: { return textureLoad(water_tex, p, i32(t.z), 0).r; }
+        case 2u: { return textureLoad(discharge_tex, p, i32(t.z), 0).r; }
+        default: { return textureLoad(height_tex, p, i32(t.z), 0).r; }
+    }
 }
 
-// Bilinear height lookup that stays continuous across cube edges.
+const HEIGHT: u32 = 0u;
+const WATER: u32 = 1u;
+const DISCHARGE: u32 = 2u;
+
 fn sample_height(dir: vec3<f32>) -> f32 {
+    return sample_field(HEIGHT, dir);
+}
+
+// Bilinear field lookup that stays continuous across cube edges.
+fn sample_field(field: u32, dir: vec3<f32>) -> f32 {
     let res = u32(material.resolution);
     let face = dir_to_face(dir);
     let st = dir_to_face_st(face, dir);
@@ -38,10 +53,10 @@ fn sample_height(dir: vec3<f32>) -> f32 {
     // `neighbor_texel` wraps any out-of-face coordinate onto the right face.
     let origin = vec3<u32>(vec2<u32>(clamp(b, vec2(0), vec2(i32(res) - 1))), face);
     let d = b - vec2<i32>(origin.xy);
-    let h00 = load_height(neighbor_texel(origin, d, res));
-    let h10 = load_height(neighbor_texel(origin, d + vec2(1, 0), res));
-    let h01 = load_height(neighbor_texel(origin, d + vec2(0, 1), res));
-    let h11 = load_height(neighbor_texel(origin, d + vec2(1, 1), res));
+    let h00 = load_field(field, neighbor_texel(origin, d, res));
+    let h10 = load_field(field, neighbor_texel(origin, d + vec2(1, 0), res));
+    let h01 = load_field(field, neighbor_texel(origin, d + vec2(0, 1), res));
+    let h11 = load_field(field, neighbor_texel(origin, d + vec2(1, 1), res));
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
 }
 
@@ -112,8 +127,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_n = normalize(mesh_normal_local_to_world(local_n, in.instance_index));
 
     var pbr: PbrInput = pbr_input_new();
-    pbr.material.base_color = vec4(terrain_color(h, slope * 8.0, abs(dir.y)), 1.0);
-    pbr.material.perceptual_roughness = select(0.85, 0.12, h < 0.0);
+    var color = terrain_color(h, slope * 8.0, abs(dir.y));
+    var roughness = select(0.85, 0.12, h < 0.0);
+    if h >= 0.0 {
+        // Rivers and lakes: strong flow or standing water on land.
+        let river = smoothstep(material.river_discharge, material.river_discharge * 4.0, sample_field(DISCHARGE, dir));
+        let lake = smoothstep(20.0, 60.0, sample_field(WATER, dir));
+        let wet = max(river, lake);
+        color = mix(color, vec3(0.04, 0.16, 0.24), wet);
+        roughness = mix(roughness, 0.1, wet);
+    }
+    pbr.material.base_color = vec4(color, 1.0);
+    pbr.material.perceptual_roughness = roughness;
     pbr.material.metallic = 0.0;
     pbr.frag_coord = in.clip_position;
     pbr.world_position = in.world_position;

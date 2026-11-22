@@ -8,11 +8,23 @@ use bevy::{
 
 use crate::sim::{FieldFormat, PassTrigger, SimAllocate, SimFields, SimGraph, SimPass};
 
-/// Field holding terrain height in metres above the sea-level datum.
+/// Terrain height in metres above the sea-level datum.
 pub const HEIGHT: &str = "height";
+/// Water depth in metres (oceans hold the sea surface at the datum).
+pub const WATER: &str = "water";
+/// Suspended sediment, in metres of terrain.
+pub const SEDIMENT: &str = "sediment";
+/// Outflow to the (+x, -x, +y, -y) neighbours, in metres of water per step.
+pub const FLUX: &str = "flux";
+/// Smoothed inflow per step: high along rivers.
+pub const DISCHARGE: &str = "discharge";
 
 const TERRAIN_INIT: &str = "terrain_init";
 const TERRAIN_RELAX: &str = "terrain_relax";
+const HYDRO_INIT: &str = "hydro_init";
+const HYDRO_FLUX: &str = "hydro_flux";
+const HYDRO_WATER: &str = "hydro_water";
+const HYDRO_ERODE: &str = "hydro_erode";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
 #[repr(C)]
@@ -41,6 +53,43 @@ impl Default for TerrainParams {
             talus_slope: 0.02,
             erosion_rate: 0.2,
             _pad: [0.0; 2],
+        }
+    }
+}
+
+/// Mirrors `HydroParams` in `shaders/planet/hydro_params.wesl`. Units are documented there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HydroParams {
+    pub planet_radius_m: f32,
+    pub rain_m: f32,
+    pub evaporation: f32,
+    pub pipe_gain: f32,
+    pub flux_damping: f32,
+    pub capacity: f32,
+    pub erosion_rate: f32,
+    pub deposition_rate: f32,
+    pub min_slope: f32,
+    pub max_erosion_m: f32,
+    pub discharge_smoothing: f32,
+    pub _pad: f32,
+}
+
+impl Default for HydroParams {
+    fn default() -> Self {
+        Self {
+            planet_radius_m: TerrainParams::default().planet_radius_m,
+            rain_m: 0.005,
+            evaporation: 0.005,
+            pipe_gain: 0.01,
+            flux_damping: 0.5,
+            capacity: 1000.0,
+            erosion_rate: 0.3,
+            deposition_rate: 0.3,
+            min_slope: 0.001,
+            max_erosion_m: 10.0,
+            discharge_smoothing: 0.05,
+            _pad: 0.0,
         }
     }
 }
@@ -78,12 +127,17 @@ impl Plugin for PlanetPlugin {
     }
 }
 
-/// The whole planet simulation so far: one field and two passes. New subsystems
-/// (hydraulic erosion, climate, vegetation, ...) add their fields and passes here.
+/// The whole planet simulation. Passes run in this order every step. New subsystems
+/// (climate, vegetation, ...) add their fields and passes here.
 fn declare_simulation(mut graph: ResMut<SimGraph>) {
     let params = TerrainParams::default();
+    let hydro = HydroParams::default();
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
+        .add_field(WATER, FieldFormat::R32Float)
+        .add_field(SEDIMENT, FieldFormat::R32Float)
+        .add_field(FLUX, FieldFormat::Rgba32Float)
+        .add_field(DISCHARGE, FieldFormat::R32Float)
         .add_pass(
             SimPass::new(
                 TERRAIN_INIT,
@@ -103,16 +157,68 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .read(HEIGHT)
             .write(HEIGHT)
             .with_params(params),
+        )
+        // Hydraulic erosion: pipe-model water flow carrying sediment.
+        .add_pass(
+            SimPass::new(HYDRO_INIT, "shaders/planet/hydro_init.wesl", "hydro_init")
+                .read(HEIGHT)
+                .write(WATER)
+                .write(SEDIMENT)
+                .write(FLUX)
+                .write(DISCHARGE)
+                .trigger(PassTrigger::OnReset)
+                .with_params(hydro),
+        )
+        .add_pass(
+            SimPass::new(HYDRO_FLUX, "shaders/planet/hydro_flux.wesl", "hydro_flux")
+                .read(HEIGHT)
+                .read(WATER)
+                .read(FLUX)
+                .write(FLUX)
+                .with_params(hydro),
+        )
+        .add_pass(
+            SimPass::new(
+                HYDRO_WATER,
+                "shaders/planet/hydro_water.wesl",
+                "hydro_water",
+            )
+            .read(HEIGHT)
+            .read(WATER)
+            .read(FLUX)
+            .read(SEDIMENT)
+            .read(DISCHARGE)
+            .write(WATER)
+            .write(SEDIMENT)
+            .write(DISCHARGE)
+            .with_params(hydro),
+        )
+        .add_pass(
+            SimPass::new(
+                HYDRO_ERODE,
+                "shaders/planet/hydro_erode.wesl",
+                "hydro_erode",
+            )
+            .read(HEIGHT)
+            .read(SEDIMENT)
+            .read(DISCHARGE)
+            .write(HEIGHT)
+            .write(SEDIMENT)
+            .with_params(hydro),
         );
 }
 
-/// Draws the planet directly from the simulation's height field.
+/// Draws the planet directly from the simulation's fields.
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
 pub struct PlanetMaterial {
     #[texture(0, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub height: Handle<Image>,
     #[uniform(1)]
     pub params: PlanetMaterialParams,
+    #[texture(2, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub water: Handle<Image>,
+    #[texture(3, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub discharge: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -120,7 +226,8 @@ pub struct PlanetMaterialParams {
     pub planet_radius_m: f32,
     pub height_exaggeration: f32,
     pub resolution: f32,
-    pub _pad: f32,
+    /// Discharge (m of water per step) above which land is drawn as river.
+    pub river_discharge: f32,
 }
 
 impl Material for PlanetMaterial {
@@ -143,11 +250,13 @@ fn spawn_planet(
 ) {
     let material = materials.add(PlanetMaterial {
         height: fields.front(HEIGHT),
+        water: fields.front(WATER),
+        discharge: fields.front(DISCHARGE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,
             resolution: graph.resolution as f32,
-            _pad: 0.0,
+            river_discharge: 0.1,
         },
     });
     commands.spawn((

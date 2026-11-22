@@ -228,7 +228,7 @@ fn window_title(
 }
 
 /// Headless run: wait for `--steps` simulation steps, then save a screenshot and the
-/// height field statistics, then exit.
+/// field statistics (`stats.txt`), then exit.
 fn headless_capture(
     mut commands: Commands,
     args: Res<Args>,
@@ -268,17 +268,16 @@ fn headless_capture(
             });
 
         let resolution = args.resolution;
-        let out = args.out.clone();
-        commands
-            .spawn(ReadbackOnce::texture(fields.front(planet::HEIGHT)))
-            .observe(
-                move |event: On<ReadbackComplete>, mut done: ResMut<CaptureDone>| {
-                    let report = height_report(&event.data, resolution);
-                    info!("headless: {report}");
-                    std::fs::write(out.join("height_stats.txt"), report + "\n").ok();
-                    done.readback = true;
-                },
-            );
+        for name in REPORTED_FIELDS {
+            commands
+                .spawn(ReadbackOnce::texture(fields.front(name)))
+                .observe(
+                    move |event: On<ReadbackComplete>, mut done: ResMut<CaptureDone>| {
+                        done.fields
+                            .push((name, FieldStats::from_r32(&event.data, resolution)));
+                    },
+                );
+        }
         commands.insert_resource(CaptureDone::default());
         state.0 = true;
         return;
@@ -291,51 +290,110 @@ fn headless_capture(
     }
 }
 
+/// R32Float fields summarised at the end of a headless run.
+const REPORTED_FIELDS: [&str; 4] = [
+    planet::HEIGHT,
+    planet::WATER,
+    planet::SEDIMENT,
+    planet::DISCHARGE,
+];
+
 #[derive(Resource, Default)]
 struct CaptureDone {
     screenshot: bool,
-    readback: bool,
+    fields: Vec<(&'static str, FieldStats)>,
 }
 
-fn exit_when_captured(done: Option<Res<CaptureDone>>, mut exit: MessageWriter<AppExit>) {
-    if let Some(done) = done
-        && done.screenshot
-        && done.readback
-    {
-        exit.write(AppExit::Success);
+fn exit_when_captured(
+    done: Option<Res<CaptureDone>>,
+    args: Res<Args>,
+    stats: Res<SimStats>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(done) = done else { return };
+    if !done.screenshot || done.fields.len() < REPORTED_FIELDS.len() {
+        return;
     }
+    let get = |name: &str| done.fields.iter().find(|(n, _)| *n == name).map(|(_, s)| s);
+    let mut report = format!(
+        "step {}, {r}x{r}x6 texels\n",
+        stats.step(),
+        r = args.resolution
+    );
+    for name in REPORTED_FIELDS {
+        let s = get(name).unwrap();
+        report += &format!(
+            "{name:>10}: min {:>9.2}  max {:>9.2}  mean {:>9.3}  >0 {:>5.1}%  non-finite {}\n",
+            s.min,
+            s.max,
+            s.mean(),
+            100.0 * s.positive as f64 / s.count.max(1) as f64,
+            s.non_finite
+        );
+    }
+    // Erosion only moves material between terrain and suspended sediment.
+    let rock = get(planet::HEIGHT).unwrap().sum + get(planet::SEDIMENT).unwrap().sum;
+    report += &format!(
+        "terrain + sediment mean: {:.4} m\n",
+        rock / get(planet::HEIGHT).unwrap().count.max(1) as f64
+    );
+    for line in report.lines() {
+        info!("headless: {line}");
+    }
+    std::fs::write(args.out.join("stats.txt"), report).ok();
+    let bad: u64 = done.fields.iter().map(|(_, s)| s.non_finite).sum();
+    exit.write(if bad == 0 {
+        AppExit::Success
+    } else {
+        error!("headless: {bad} non-finite texels");
+        AppExit::error()
+    });
 }
 
-/// Summarises an R32Float cube-sphere readback (rows padded to 256 bytes).
-fn height_report(data: &[u8], resolution: u32) -> String {
-    let row = (resolution as usize * 4).next_multiple_of(256);
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    let (mut sum, mut land, mut count, mut bad) = (0.0f64, 0u64, 0u64, 0u64);
-    for layer in 0..6 {
-        for y in 0..resolution as usize {
-            let start = (layer * resolution as usize + y) * row;
-            let Some(bytes) = data.get(start..start + resolution as usize * 4) else {
-                return format!("readback too short: {} bytes", data.len());
-            };
-            for v in bytes.as_chunks::<4>().0 {
-                let h = f32::from_le_bytes(*v);
-                if !h.is_finite() {
-                    bad += 1;
-                    continue;
+#[derive(Debug, Default)]
+struct FieldStats {
+    min: f32,
+    max: f32,
+    sum: f64,
+    count: u64,
+    positive: u64,
+    non_finite: u64,
+}
+
+impl FieldStats {
+    /// Summarises an R32Float cube-sphere readback (rows padded to 256 bytes).
+    fn from_r32(data: &[u8], resolution: u32) -> Self {
+        let res = resolution as usize;
+        let row = (res * 4).next_multiple_of(256);
+        let mut s = FieldStats {
+            min: f32::INFINITY,
+            max: f32::NEG_INFINITY,
+            ..default()
+        };
+        for layer in 0..6 {
+            for y in 0..res {
+                let start = (layer * res + y) * row;
+                let bytes = data
+                    .get(start..start + res * 4)
+                    .expect("readback shorter than the field");
+                for v in bytes.as_chunks::<4>().0 {
+                    let x = f32::from_le_bytes(*v);
+                    if !x.is_finite() {
+                        s.non_finite += 1;
+                        continue;
+                    }
+                    s.min = s.min.min(x);
+                    s.max = s.max.max(x);
+                    s.sum += x as f64;
+                    s.positive += (x > 0.0) as u64;
+                    s.count += 1;
                 }
-                min = min.min(h);
-                max = max.max(h);
-                sum += h as f64;
-                land += (h > 0.0) as u64;
-                count += 1;
             }
         }
+        s
     }
-    format!(
-        "height field {resolution}x{resolution}x6: min {min:.0} m, max {max:.0} m, mean {:.0} m, \
-         land {:.1}%, non-finite texels {bad}",
-        sum / count.max(1) as f64,
-        100.0 * land as f64 / count.max(1) as f64
-    )
+
+    fn mean(&self) -> f64 {
+        self.sum / self.count.max(1) as f64
+    }
 }
