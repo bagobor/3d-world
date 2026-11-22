@@ -24,6 +24,10 @@ pub const MOISTURE: &str = "moisture";
 pub const TEMPERATURE: &str = "temperature";
 /// Biome class index ([`Biome`]), stored as f32.
 pub const BIOME: &str = "biome";
+/// Live plant cover: r grass, g shrubs, b trees (0..1 each), a fuel (dead litter).
+pub const PLANTS: &str = "plants";
+/// Live fire intensity (0..1) burning this step.
+pub const FIRE: &str = "fire";
 
 /// Bump when generation changes, so cached planets from older generators are not loaded.
 pub const GENERATOR_VERSION: &str = "planet-v1";
@@ -85,6 +89,9 @@ const HYDRO_WATER: &str = "hydro_water";
 const HYDRO_ERODE: &str = "hydro_erode";
 const MOISTURE_SPREAD: &str = "moisture_spread";
 const GENERATION_FINALIZE: &str = "generation_finalize";
+const PLANTS_INIT: &str = "plants_init";
+const PLANTS_GROW: &str = "plants_grow";
+const FIRE_SPREAD: &str = "fire_spread";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
 #[repr(C)]
@@ -187,6 +194,51 @@ impl Default for EnvParams {
     }
 }
 
+/// Mirrors `PlantParams` in `shaders/planet/plant_params.wesl`. One live step is about a
+/// month.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PlantParams {
+    pub growth_grass: f32,
+    pub growth_shrub: f32,
+    pub growth_tree: f32,
+    pub spread: f32,
+    pub seed_rain: f32,
+    pub litter_rate: f32,
+    pub decay_rate: f32,
+    pub ignition_rate: f32,
+    pub spread_chance: f32,
+    pub burn_grass: f32,
+    pub burn_shrub: f32,
+    pub burn_tree: f32,
+    pub subtropic_dryness: f32,
+    pub lake_depth_m: f32,
+    pub _pad: [f32; 2],
+}
+
+impl Default for PlantParams {
+    fn default() -> Self {
+        let env = EnvParams::default();
+        Self {
+            growth_grass: 0.3,
+            growth_shrub: 0.06,
+            growth_tree: 0.025,
+            spread: 1.0,
+            seed_rain: 0.0005,
+            litter_rate: 0.02,
+            decay_rate: 0.04,
+            ignition_rate: 5e-6,
+            spread_chance: 0.7,
+            burn_grass: 0.95,
+            burn_shrub: 0.8,
+            burn_tree: 0.6,
+            subtropic_dryness: env.subtropic_dryness,
+            lake_depth_m: env.lake_depth_m,
+            _pad: [0.0; 2],
+        }
+    }
+}
+
 pub struct PlanetPlugin {
     /// Vertices along one cube-face edge of the render mesh.
     pub mesh_subdivisions: u32,
@@ -223,11 +275,12 @@ impl Plugin for PlanetPlugin {
 
 /// The planet. Generation (run once, then cached) builds terrain, erodes it with water,
 /// spreads moisture inland and finally derives static temperature and biome maps. Live
-/// passes (ecosystem, ...) will be added with `SimPhase::Live`.
+/// passes run the plant ecosystem (growth, competition, wildfire) for the rest of the session.
 fn declare_simulation(mut graph: ResMut<SimGraph>) {
     let terrain = TerrainParams::default();
     let hydro = HydroParams::default();
     let env = EnvParams::default();
+    let plants = PlantParams::default();
     let generate = |pass: SimPass| pass.phase(SimPhase::Generate);
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
@@ -238,6 +291,8 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         .add_field(MOISTURE, FieldFormat::R32Float)
         .add_field(TEMPERATURE, FieldFormat::R32Float)
         .add_field(BIOME, FieldFormat::R32Float)
+        .add_field(PLANTS, FieldFormat::Rgba32Float)
+        .add_field(FIRE, FieldFormat::R32Float)
         // Initial state.
         .add_pass(generate(
             SimPass::new(
@@ -338,6 +393,49 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .write(BIOME)
             .trigger(PassTrigger::AfterGeneration)
             .with_params(env),
+        )
+        // Live: the plant ecosystem, on top of the baked planet.
+        .add_pass(
+            SimPass::new(
+                PLANTS_INIT,
+                "shaders/planet/plants_init.wesl",
+                "plants_init",
+            )
+            .read(TEMPERATURE)
+            .read(MOISTURE)
+            .read(BIOME)
+            .write(PLANTS)
+            .write(FIRE)
+            .trigger(PassTrigger::OnReset)
+            .with_params(plants),
+        )
+        .add_pass(
+            SimPass::new(
+                PLANTS_GROW,
+                "shaders/planet/plants_grow.wesl",
+                "plants_grow",
+            )
+            .read(PLANTS)
+            .read(FIRE)
+            .read(TEMPERATURE)
+            .read(MOISTURE)
+            .read(BIOME)
+            .write(PLANTS)
+            .with_params(plants),
+        )
+        .add_pass(
+            SimPass::new(
+                FIRE_SPREAD,
+                "shaders/planet/fire_spread.wesl",
+                "fire_spread",
+            )
+            .read(PLANTS)
+            .read(FIRE)
+            .read(TEMPERATURE)
+            .read(MOISTURE)
+            .read(BIOME)
+            .write(FIRE)
+            .with_params(plants),
         );
     // What a generated planet is: everything the renderer and live simulation read.
     for field in [HEIGHT, WATER, DISCHARGE, MOISTURE, TEMPERATURE, BIOME] {
@@ -360,6 +458,10 @@ pub struct PlanetMaterial {
     pub temperature: Handle<Image>,
     #[texture(5, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub biome: Handle<Image>,
+    #[texture(6, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub plants: Handle<Image>,
+    #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub fire: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -397,6 +499,8 @@ fn spawn_planet(
         discharge: fields.front(DISCHARGE),
         temperature: fields.front(TEMPERATURE),
         biome: fields.front(BIOME),
+        plants: fields.front(PLANTS),
+        fire: fields.front(FIRE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,

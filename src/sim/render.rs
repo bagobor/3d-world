@@ -152,6 +152,7 @@ fn prepare_sim(
                         pass.label, pass.shader
                     );
                     runtime.failed = true;
+                    stats.set_failed();
                     return;
                 }
                 _ => all_ok = false,
@@ -235,9 +236,15 @@ fn prepare_sim(
             info!("sim: generation finished");
         }
     }
-    if runtime.phase == SimPhase::Live && !control.paused {
+    if runtime.phase == SimPhase::Live {
         let room = max - runtime.plan.len() as u64;
-        for _ in 0..(control.steps_per_frame as u64).min(room) {
+        // As in generation, step 0 runs even while paused so live OnReset passes initialise.
+        let budget = match (control.paused, runtime.step) {
+            (true, 0) => 1,
+            (true, _) => 0,
+            (false, _) => control.steps_per_frame as u64,
+        };
+        for _ in 0..budget.min(room) {
             let step = runtime.step;
             let slot = runtime.plan.len() as u32;
             runtime.plan.push(Planned {
@@ -483,9 +490,8 @@ fn run_sim(
         for (pass, pass_gpu) in passes() {
             let due = pass.phase == planned.phase
                 && match pass.trigger {
-                    PassTrigger::OnReset => {
-                        planned.phase == SimPhase::Generate && planned.step == 0
-                    }
+                    // Step 0 of the pass's own phase.
+                    PassTrigger::OnReset => planned.step == 0,
                     PassTrigger::EveryStep => true,
                     PassTrigger::EveryNSteps(n) => planned.step.is_multiple_of(n.max(1) as u64),
                     PassTrigger::AfterGeneration => false,

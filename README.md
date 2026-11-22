@@ -19,9 +19,13 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
   to a disk cache and later starts load it and run no geology (screenshot: seed 7, 3000
   generation steps at 512²).
 
+- Step 4: live plant ecosystem. Grass, shrubs and trees grow, shade each other, spread and
+  burn in wildfires, on top of the baked planet (screenshot: 600 live steps).
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: vegetation, animals, terrain LOD, atmosphere.
+Next: terrain LOD (from space to the surface), atmosphere and ocean, vegetation and animal
+rendering, animals.
 
 ## Running
 
@@ -41,7 +45,8 @@ The first start with a given seed and resolution generates the planet
 turns the cache off, `--cache DIR` moves it.
 
 Headless mode renders to an offscreen image, saves `planet.png` and `stats.txt` (min/max/mean
-of the baked fields and the share of each biome), and exits. It works on a software Vulkan
+of every field and plant layer, and the share of each biome), and exits. `--steps N` runs N
+live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
 
 ## Layout
@@ -59,6 +64,7 @@ assets/shaders/
   planet/terrain_*.wesl   terrain passes
   planet/hydro_*.wesl     hydraulic erosion passes
   planet/moisture_spread.wesl, generation_finalize.wesl   environment maps + biomes
+  planet/plants_*.wesl, fire_spread.wesl                  live plant ecosystem
   planet/planet_material.wesl   displaces + shades the planet from the height field
 ```
 
@@ -112,8 +118,9 @@ the disk cache when generation finishes; a start that finds a valid file uploads
 field textures and goes straight to Live. Bump `GENERATOR_VERSION` in `src/planet/mod.rs`
 whenever generation changes, so old planets are not loaded.
 
-The planet's generate phase is terrain + hydraulic erosion + moisture spreading. It has no
-live passes yet; vegetation and animals will be the first.
+The planet's generate phase is terrain + hydraulic erosion + moisture spreading. Its live
+phase is the plant ecosystem. `PassTrigger::OnReset` passes run at step 0 of their own phase,
+so live state is initialised whether the planet was generated or loaded.
 
 ### Environment maps
 
@@ -125,6 +132,25 @@ live passes yet; vegetation and animals will be the first.
   ocean, lake, ice, tundra, desert, boreal and temperate forest, grassland, shrubland,
   savanna, tropical forest. The planet material colours land by biome, with beaches, bare
   rock on steep slopes and snow from temperature.
+
+### Plant ecosystem
+
+Live fields: `plants` (rgba: grass, shrub and tree cover 0..1, plus fuel, the dead litter
+fires burn) and `fire` (intensity burning this step). One live step is roughly a month.
+
+1. `plants_init` (step 0): a sparse, patchy first cover wherever each type can grow.
+2. `plants_grow`: each type grows logistically toward a carrying capacity set by temperature
+   and precipitation. Trees shade shrubs and grass, shrubs shade grass, so forests take over
+   where it is wet enough. Bare land is colonised from neighbouring cover. Living cover drops
+   litter, which decomposes faster when wet. Fires remove cover (grass most, trees least)
+   and all fuel.
+3. `fire_spread`: lightning ignites texels at random, and burning texels ignite neighbours,
+   both in proportion to flammability (fuel, dryness, warmth). A burnt texel has no fuel, so
+   fires leave firebreaks and burn out; in dry grassland and savanna they recur and keep
+   the land open, in wet forest they hardly start.
+
+Constants are in `PlantParams`. The planet material draws bare ground by biome, then grass,
+shrubs and trees by cover, and fires as an emissive glow.
 
 ### Hydraulic erosion
 
