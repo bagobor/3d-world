@@ -26,12 +26,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      # Compiles every compute and material shader, runs the simulation on a CPU Vulkan
-      # driver (lavapipe), and checks the result.
-      - name: Headless simulation smoke test
+      # Compiles every compute and material shader, generates a small planet on a CPU Vulkan
+      # driver (lavapipe) and saves it to the cache, then starts again and must load it.
+      - name: Headless generation smoke test
         env:
           WGPU_BACKEND: vulkan
-        run: cargo run -- --headless --steps 256 --steps-per-frame 32 --resolution 256 --out out
+        run: |
+          cargo run -- --headless --generation-steps 256 --generation-steps-per-frame 32 \
+            --resolution 256 --cache cache --out out 2>&1 | tee generate.log
+          grep -q "sim cache: saved planet" generate.log
+          cargo run -- --headless --resolution 256 --cache cache --out out/reloaded 2>&1 \
+            | tee reload.log
+          grep -q "sim cache: loaded planet" reload.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -1,6 +1,6 @@
 # 3d-world
 
-A procedural 3D planet simulator tech demo in Rust: GPU-simulated terrain, climate and
+A procedural 3D planet simulator tech demo in Rust: GPU-generated planets and living
 ecosystems, rendered as photorealistically as we can manage.
 
 Built on [Bevy](https://bevy.org) 0.20 (wgpu, Vulkan backend). The heavy lifting is GPU
@@ -13,22 +13,36 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
   heightfield and thermal erosion.
 - Step 2: hydraulic erosion. Rain, pipe-model water flow, sediment transport, erosion and
-  deposition carve drainage networks, lakes and deltas (screenshot: 3000 steps at 512²).
+  deposition carve drainage networks, lakes and deltas.
+- Step 3: planet generation bake. Terrain and erosion run once, offline, as a generate
+  phase; then static moisture, temperature and biome maps are derived. The result is saved
+  to a disk cache and later starts load it and run no geology (screenshot: seed 7, 3000
+  generation steps at 512²).
 
-Next: climate, vegetation, animals, terrain LOD, atmosphere.
+There is no climate simulation and no seasons: the environment maps are static.
+
+Next: vegetation, animals, terrain LOD, atmosphere.
 
 ## Running
 
 ```sh
 cargo run --release                  # window: drag to orbit, scroll to zoom
 cargo run --release -- --help        # options
-cargo run --release -- --headless --steps 2000 --out out  # no window: writes out/planet.png
+cargo run --release -- --headless --out out  # no window: writes out/planet.png
+cargo run --release -- --seed 3 --regenerate  # ignore the cached planet, generate again
 ```
 
-Keys: **Space** pause, **R** new planet (next seed), **Up/Down** simulation steps per frame.
+Keys: **Space** pause, **R** generate a new planet (next seed), **Up/Down** live simulation
+steps per frame.
+
+The first start with a given seed and resolution generates the planet
+(`--generation-steps`, default 3000) and writes it to `cache/planet-v1-seed<seed>-res<res>.bin`
+(about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
+turns the cache off, `--cache DIR` moves it.
 
 Headless mode renders to an offscreen image, saves `planet.png` and `stats.txt` (min/max/mean
-of every field, plus the terrain + sediment total, which erosion must conserve), and exits. It works on a software Vulkan driver (Mesa lavapipe), which is what CI uses.
+of the baked fields and the share of each biome), and exits. It works on a software Vulkan
+driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
 
 ## Layout
 
@@ -36,6 +50,7 @@ of every field, plus the terrain + sediment total, which erosion must conserve),
 src/sim/          GPU simulation framework (reusable, knows nothing about planets)
   mod.rs          fields, passes, controls, the main-world API
   render.rs       render-world side: pipelines, bind groups, dispatch, double buffering
+  cache.rs        disk cache of baked fields
 src/planet/       the planet: declares fields + passes, renders from them
   mod.rs          TerrainParams, PlanetMaterial, the simulation declaration
   mesh.rs         cube-sphere mesh (same face convention as the shaders)
@@ -43,6 +58,7 @@ assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
   planet/hydro_*.wesl     hydraulic erosion passes
+  planet/moisture_spread.wesl, generation_finalize.wesl   environment maps + biomes
   planet/planet_material.wesl   displaces + shades the planet from the height field
 ```
 
@@ -86,6 +102,30 @@ Dispatch is `@workgroup_size(8, 8, 1)` over `res × res × 6`, with `global_invo
 the cube face. `neighbor_texel` in `sim/common.wesl` steps across cube edges, so stencils
 work seamlessly over the whole sphere.
 
+### Generate, then live
+
+Every pass belongs to a phase. **Generate** runs `SimPhase::Generate` passes for
+`SimControl::generation_steps` steps, many steps per frame, then the
+`PassTrigger::AfterGeneration` passes once. **Live** then runs `SimPhase::Live` passes for
+the rest of the session. Fields marked with `SimGraph::bake` are read back and written to
+the disk cache when generation finishes; a start that finds a valid file uploads it into the
+field textures and goes straight to Live. Bump `GENERATOR_VERSION` in `src/planet/mod.rs`
+whenever generation changes, so old planets are not loaded.
+
+The planet's generate phase is terrain + hydraulic erosion + moisture spreading. It has no
+live passes yet; vegetation and animals will be the first.
+
+### Environment maps
+
+- `moisture` (0..1): spreads inland from oceans, lakes and rivers, decaying with distance
+  and with every climb over high ground, so ranges cast rain shadows. It also scales
+  rainfall during erosion, so wet coasts carve more than dry interiors.
+- `temperature` (°C, `generation_finalize`): warm equator, cold poles, 6.5 °C/km lapse rate.
+- `biome`: from temperature and precipitation (moisture, dried in the subtropical belt):
+  ocean, lake, ice, tundra, desert, boreal and temperate forest, grassland, shrubland,
+  savanna, tropical forest. The planet material colours land by biome, with beaches, bare
+  rock on steep slopes and snow from temperature.
+
 ### Hydraulic erosion
 
 Fields: `water` (depth, m), `sediment` (suspended, m of rock), `flux` (outflow to the 4
@@ -98,8 +138,9 @@ neighbours, rgba), `discharge` (smoothed inflow, high along rivers). Per step:
 3. `hydro_erode`: sediment capacity = `capacity × discharge × slope`. Below it the water
    digs (never below the lowest neighbour), above it drops sediment.
 
-Material only moves between `height` and `sediment`, so their sum is conserved; the headless
-report shows it (drift ~0.001 m over 3000 steps from float rounding). Fluxes are stored in
+Material only moves between `height` and `sediment`, so their sum is conserved (drift
+~0.001 m over 3000 steps from float rounding); `generation_finalize` settles the remaining
+sediment back onto the terrain. Fluxes are stored in
 each cell's own face frame, and `reverse_direction` in `common.wesl` finds the matching slot
 across rotated cube faces, so rivers cross face edges seamlessly. Constants live in
 `HydroParams` and are tuned for geological time at planet scale, not real-world units.
@@ -107,8 +148,8 @@ across rotated cube faces, so rivers cross face edges seamlessly. Constants live
 ### Single queue
 
 wgpu exposes one queue, so simulation and rendering share every frame's GPU time.
-`SimControl::steps_per_frame` is the time-slicing knob; for long runs, run headless with many
-steps per frame (a "bake"), or pause the simulation while exploring.
+`SimControl::steps_per_frame` is the live time-slicing knob; generation instead uses
+`generation_steps_per_frame` and gives up frame rate to finish quickly.
 
 ### Cube-sphere convention
 

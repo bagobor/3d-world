@@ -1,4 +1,5 @@
-// Resets the water system: oceans filled to sea level, land dry, no flux or sediment.
+// Resets the water system: oceans filled to sea level, land dry, no flux or sediment,
+// moisture only over the oceans.
 import super::super::sim::common::SimGlobals;
 import super::hydro_params::HydroParams;
 
@@ -9,6 +10,7 @@ import super::hydro_params::HydroParams;
 @group(0) @binding(4) var sediment_out: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(5) var flux_out: texture_storage_2d_array<rgba32float, write>;
 @group(0) @binding(6) var discharge_out: texture_storage_2d_array<r32float, write>;
+@group(0) @binding(7) var moisture_out: texture_storage_2d_array<r32float, write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn hydro_init(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -22,4 +24,5 @@ fn hydro_init(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(sediment_out, p, layer, vec4(0.0));
     textureStore(flux_out, p, layer, vec4(0.0));
     textureStore(discharge_out, p, layer, vec4(0.0));
+    textureStore(moisture_out, p, layer, vec4(select(0.0, 1.0, h < 0.0), 0.0, 0.0, 0.0));
 }
