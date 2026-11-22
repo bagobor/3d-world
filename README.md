@@ -8,6 +8,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 
 ![planet](docs/planet.png)
 
+| low orbit | eye height |
+|---|---|
+| ![orbit](docs/orbit.png) | ![surface](docs/surface.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -22,30 +26,36 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 - Step 4: live plant ecosystem. Grass, shrubs and trees grow, shade each other, spread and
   burn in wildfires, on top of the baked planet (screenshot: 600 live steps).
 
+- Step 5: level-of-detail terrain. A quadtree of chunks per cube face streams in detail
+  around the camera, from the whole planet down to eye height, with a floating origin.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: terrain LOD (from space to the surface), atmosphere and ocean, vegetation and animal
-rendering, animals.
+Next: atmosphere and ocean, vegetation and animal rendering, animals.
 
 ## Running
 
 ```sh
-cargo run --release                  # window: drag to orbit, scroll to zoom
+cargo run --release                  # window (controls below)
 cargo run --release -- --help        # options
 cargo run --release -- --headless --out out  # no window: writes out/planet.png
 cargo run --release -- --seed 3 --regenerate  # ignore the cached planet, generate again
 ```
 
-Keys: **Space** pause, **R** generate a new planet (next seed), **Up/Down** live simulation
-steps per frame.
+Mouse: **left-drag** moves over the planet, **right-drag** looks around, **scroll** changes
+altitude (from 20 planet radii down to eye height). Keys: **WASD** fly (**Shift** faster),
+**Space** pause, **R** generate a new planet (next seed), **Up/Down** live simulation steps
+per frame.
 
 The first start with a given seed and resolution generates the planet
 (`--generation-steps`, default 3000) and writes it to `cache/planet-v1-seed<seed>-res<res>.bin`
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders to an offscreen image, saves `planet.png` and `stats.txt` (min/max/mean
-of every field and plant layer, and the share of each biome), and exits. `--steps N` runs N
+Headless mode renders offscreen and saves three views, `planet.png` (whole planet),
+`orbit.png` (low orbit) and `surface.png` (40 m above hilly land near the middle of the first
+view), each once its terrain detail has streamed in, plus `stats.txt` (min/max/mean of every
+field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
 
@@ -55,10 +65,13 @@ driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8
 src/sim/          GPU simulation framework (reusable, knows nothing about planets)
   mod.rs          fields, passes, controls, the main-world API
   render.rs       render-world side: pipelines, bind groups, dispatch, double buffering
-  cache.rs        disk cache of baked fields
+  cache.rs        baked fields on the CPU, disk cache
 src/planet/       the planet: declares fields + passes, renders from them
   mod.rs          TerrainParams, PlanetMaterial, the simulation declaration
   mesh.rs         cube-sphere mesh (same face convention as the shaders)
+  surface.rs      CPU surface: bicubic baked height + procedural detail, in f64
+  lod.rs          quadtree LOD terrain chunks
+  camera.rs       planet camera (f64) and floating origin
 assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
@@ -151,6 +164,26 @@ fires burn) and `fire` (intensity burning this step). One live step is roughly a
 
 Constants are in `PlantParams`. The planet material draws bare ground by biome, then grass,
 shrubs and trees by cover, and fires as an emissive glow.
+
+### Level-of-detail terrain
+
+While the planet generates, a GPU-displaced sphere previews the live height field. Once it
+is baked, the baked fields are copied to the CPU and the planet is drawn as LOD terrain:
+
+- **Surface** (`surface.rs`): the baked height (~20 km texels, sampled bicubically across
+  cube edges) plus fractal detail from 40 km down to the mesh spacing, rougher and ridged in
+  mountains, gentler in lowlands. Everything is f64.
+- **Quadtree** (`lod.rs`): each cube face is a quadtree of 32×32-quad chunks, up to level 19
+  (~0.3 m between vertices). A chunk splits when the camera is nearer than 2.4 edge lengths;
+  chunks wholly behind the horizon are skipped. Chunks are built on the async compute pool,
+  nearest first, with positions relative to the chunk centre. A chunk is replaced by its
+  children only once all four are built, so there are never holes; skirts cover cracks
+  between levels.
+- **Floating origin** (`camera.rs`): the camera's position is kept in f64, the render camera
+  sits at the origin, and every chunk is placed at `centre − camera` each frame, so f32
+  precision is never a problem, from 20 radii out to 1.8 m above the ground.
+- **Shading**: the same field-driven colours as before; up close, noise breaks the 20 km
+  plant cover into groves and clearings, and octaves smaller than a few pixels fade out.
 
 ### Hydraulic erosion
 

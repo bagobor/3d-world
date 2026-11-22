@@ -1,12 +1,29 @@
 //! The planet: declares its simulation fields and passes, and renders the result.
 
+pub mod camera;
+pub mod lod;
 pub mod mesh;
+pub mod surface;
 
 use bevy::{
-    light::NotShadowCaster, prelude::*, render::render_resource::AsBindGroup, shader::ShaderRef,
+    light::NotShadowCaster,
+    math::DVec3,
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{MaterialPipeline, MaterialPipelineKey},
+    prelude::*,
+    render::render_resource::{
+        AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    },
+    shader::ShaderRef,
 };
 
-use crate::sim::{FieldFormat, PassTrigger, SimAllocate, SimFields, SimGraph, SimPass, SimPhase};
+use crate::sim::{
+    FieldFormat, PassTrigger, SimAllocate, SimControl, SimFields, SimGraph, SimPass, SimPhase,
+    cache::BakedFields,
+};
+use camera::{PlanetAnchor, PlanetCamera};
+use lod::{LodSettings, TerrainLod};
+use surface::{CubeField, DetailParams, PlanetSurface};
 
 /// Terrain height in metres above the sea-level datum.
 pub const HEIGHT: &str = "height";
@@ -240,9 +257,12 @@ impl Default for PlantParams {
 }
 
 pub struct PlanetPlugin {
-    /// Vertices along one cube-face edge of the render mesh.
+    /// Vertices along one cube-face edge of the preview mesh shown while generating.
     pub mesh_subdivisions: u32,
+    /// Vertical exaggeration of the generation preview.
     pub height_exaggeration: f32,
+    /// The level-of-detail terrain shown once the planet is generated.
+    pub terrain: LodSettings,
 }
 
 impl Default for PlanetPlugin {
@@ -250,6 +270,7 @@ impl Default for PlanetPlugin {
         Self {
             mesh_subdivisions: 256,
             height_exaggeration: 25.0,
+            terrain: LodSettings::default(),
         }
     }
 }
@@ -260,16 +281,90 @@ struct PlanetConfig {
     height_exaggeration: f32,
 }
 
+/// Systems that move the camera; the floating origin runs after them.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CameraControl;
+
 impl Plugin for PlanetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<PlanetMaterial>::default())
-            .insert_resource(PlanetConfig {
-                mesh_subdivisions: self.mesh_subdivisions,
-                height_exaggeration: self.height_exaggeration,
-            })
-            .add_systems(Startup, declare_simulation)
-            .add_systems(PostStartup, spawn_planet.after(SimAllocate))
-            .add_systems(Update, toggle_biome_view);
+        let radius = TerrainParams::default().planet_radius_m as f64;
+        app.add_plugins((
+            MaterialPlugin::<PlanetMaterial>::default(),
+            MaterialPlugin::<TerrainMaterial>::default(),
+        ))
+        .insert_resource(PlanetConfig {
+            mesh_subdivisions: self.mesh_subdivisions,
+            height_exaggeration: self.height_exaggeration,
+        })
+        .insert_resource(TerrainLod::new(self.terrain))
+        .insert_resource(PlanetCamera::new(radius))
+        .add_systems(Startup, declare_simulation)
+        .add_systems(PostStartup, spawn_planet.after(SimAllocate))
+        .add_systems(
+            Update,
+            (
+                toggle_biome_view,
+                load_terrain_surface,
+                camera::clamp_camera.after(CameraControl),
+                lod::update_terrain.after(camera::clamp_camera),
+                camera::apply_floating_origin.after(lod::update_terrain),
+                swap_preview_for_terrain.after(lod::update_terrain),
+            ),
+        );
+    }
+}
+
+/// The terrain material, shared by every chunk.
+#[derive(Resource)]
+struct TerrainMaterialHandle(Handle<TerrainMaterial>);
+
+/// The GPU-displaced sphere shown while the planet is generating.
+#[derive(Component)]
+struct GenerationPreview;
+
+/// When a planet is baked (generated or loaded), hand its height field to the LOD terrain.
+fn load_terrain_surface(
+    mut commands: Commands,
+    baked: Res<BakedFields>,
+    control: Res<SimControl>,
+    material: Option<Res<TerrainMaterialHandle>>,
+    mut lod: ResMut<TerrainLod>,
+    mut loaded: Local<u64>,
+) {
+    let Some(material) = material else { return };
+    if !baked.ready() || baked.version == *loaded {
+        return;
+    }
+    *loaded = baked.version;
+    let Some(height) = baked.f32_field(HEIGHT) else {
+        error!("terrain: the baked planet has no `{HEIGHT}` field");
+        return;
+    };
+    let surface = PlanetSurface {
+        radius_m: TerrainParams::default().planet_radius_m as f64,
+        height: CubeField::new(baked.resolution, height),
+        detail: DetailParams {
+            seed: control.seed,
+            ..default()
+        },
+    };
+    info!("terrain: new planet surface (seed {})", baked.seed);
+    lod.set_surface(&mut commands, surface, material.0.clone());
+}
+
+/// Show the LOD terrain once it has something to draw; until then, the preview sphere.
+fn swap_preview_for_terrain(
+    lod: Res<TerrainLod>,
+    stats: Res<crate::sim::SimStats>,
+    mut previews: Query<&mut Visibility, With<GenerationPreview>>,
+) {
+    let terrain = lod.ready() && stats.live();
+    for mut vis in &mut previews {
+        vis.set_if_neq(if terrain {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        });
     }
 }
 
@@ -483,6 +578,73 @@ impl Material for PlanetMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/planet/planet_material.wesl".into()
     }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // The shader file also holds the terrain entry points.
+        descriptor.vertex.entry_point = Some("vertex".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.entry_point = Some("fragment".into());
+        }
+        Ok(())
+    }
+}
+
+/// Draws LOD terrain chunks: same fields and shading as [`PlanetMaterial`], but positions
+/// and normals come from the chunk mesh (see [`lod::build_chunk`]).
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct TerrainMaterial {
+    #[texture(0, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub height: Handle<Image>,
+    #[uniform(1)]
+    pub params: PlanetMaterialParams,
+    #[texture(2, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub water: Handle<Image>,
+    #[texture(3, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub discharge: Handle<Image>,
+    #[texture(4, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub temperature: Handle<Image>,
+    #[texture(5, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub biome: Handle<Image>,
+    #[texture(6, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub plants: Handle<Image>,
+    #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub fire: Handle<Image>,
+}
+
+impl Material for TerrainMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/planet/planet_material.wesl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/planet/planet_material.wesl".into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let vertex_layout = layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+            lod::ATTRIBUTE_SURFACE.at_shader_location(2),
+        ])?;
+        descriptor.vertex.buffers = vec![vertex_layout];
+        descriptor.vertex.entry_point = Some("terrain_vertex".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.entry_point = Some("terrain_fragment".into());
+        }
+        // Skirts are seen from both sides.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
 }
 
 fn spawn_planet(
@@ -492,7 +654,25 @@ fn spawn_planet(
     fields: Res<SimFields>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PlanetMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
 ) {
+    let terrain = terrain_materials.add(TerrainMaterial {
+        height: fields.front(HEIGHT),
+        water: fields.front(WATER),
+        discharge: fields.front(DISCHARGE),
+        temperature: fields.front(TEMPERATURE),
+        biome: fields.front(BIOME),
+        plants: fields.front(PLANTS),
+        fire: fields.front(FIRE),
+        params: PlanetMaterialParams {
+            planet_radius_m: TerrainParams::default().planet_radius_m,
+            height_exaggeration: 1.0,
+            resolution: graph.resolution as f32,
+            river_discharge: 0.1,
+            show_biomes: 1.0,
+        },
+    });
+    commands.insert_resource(TerrainMaterialHandle(terrain));
     let material = materials.add(PlanetMaterial {
         height: fields.front(HEIGHT),
         water: fields.front(WATER),
@@ -515,7 +695,9 @@ fn spawn_planet(
         MeshMaterial3d(material),
         // The shadow pass uses the default vertex shader, which doesn't displace.
         NotShadowCaster,
-        Transform::default(),
+        Transform::from_scale(Vec3::splat(TerrainParams::default().planet_radius_m)),
+        PlanetAnchor(DVec3::ZERO),
+        GenerationPreview,
     ));
 }
 

@@ -87,6 +87,7 @@ impl Plugin for GpuSimPlugin {
             .init_resource::<SimControl>()
             .init_resource::<SimStats>()
             .insert_resource(cache::SimCache::new(self.cache.clone()))
+            .init_resource::<cache::BakedFields>()
             .add_plugins((
                 ExtractResourcePlugin::<SimGraph>::default(),
                 ExtractResourcePlugin::<SimFields>::default(),
@@ -506,13 +507,15 @@ fn allocate_fields(
     graph: Res<SimGraph>,
     mut control: ResMut<SimControl>,
     mut cache: ResMut<cache::SimCache>,
+    mut baked: ResMut<cache::BakedFields>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let res = graph.resolution;
     // Restore a previously generated planet if the cache has one for this seed.
     let mut restored = cache.load(&graph, control.seed);
-    if restored.is_some() {
+    if let Some(r) = &restored {
         control.skip_generation = true;
+        baked.set(res, control.seed, r.clone());
     }
     let mut fields = HashMap::default();
     for desc in &graph.fields {

@@ -1,6 +1,10 @@
-// Renders the planet straight from the simulation's `height` field: the vertex stage
-// displaces a unit cube-sphere, the fragment stage derives normals and colours from the same
-// field and runs Bevy's PBR lighting.
+// Planet shading, shared by two materials:
+// - `vertex`/`fragment` (PlanetMaterial): the generation preview. The vertex stage displaces
+//   a unit cube-sphere by the live `height` field; normals come from the same field.
+// - `terrain_vertex`/`terrain_fragment` (TerrainMaterial): LOD terrain chunks built on the
+//   CPU (see src/planet/lod.rs), with chunk-local positions, normals including the
+//   procedural detail, and per-vertex direction + height.
+// Both colour the surface from the simulation's fields and run Bevy's PBR lighting.
 
 import bevy_pbr::render::{
     mesh_functions::{get_world_from_local, mesh_position_local_to_world, mesh_normal_local_to_world},
@@ -10,7 +14,7 @@ import bevy_pbr::render::{
     pbr_functions as fns,
 };
 import bevy_core_pipeline::tonemapping::tone_mapping;
-import super::super::sim::common::{dir_to_face, dir_to_face_st, neighbor_texel};
+import super::super::sim::common::{dir_to_face, dir_to_face_st, neighbor_texel, gradient_noise};
 
 struct PlanetMaterialParams {
     planet_radius_m: f32,
@@ -156,19 +160,46 @@ fn vertex(in: Vertex) -> VertexOutput {
     return out;
 }
 
+// Fractal noise in metres for surface detail below the fields' resolution. Octaves smaller
+// than a few pixels fade out, so distant views don't shimmer.
+fn detail_noise(dir: vec3<f32>, pixel_m: f32, seed: u32) -> f32 {
+    let p = dir * material.planet_radius_m;
+    var sum = 0.0;
+    // Nearly equal amplitude per octave, so there is variation at every distance.
+    var amp = 0.3;
+    var wavelength = 6000.0;
+    for (var i = 0u; i < 9u; i++) {
+        let fade = smoothstep(2.0 * pixel_m, 8.0 * pixel_m, wavelength);
+        sum += amp * fade * gradient_noise(p / wavelength, seed + i * 31u);
+        wavelength *= 0.4;
+        amp *= 0.8;
+    }
+    return sum;
+}
+
 // Land colour: bare ground by biome, then grass, shrubs and trees by their live cover.
-fn biome_color(dir: vec3<f32>, h: f32, slope: f32) -> vec3<f32> {
+// Up close, noise breaks the smooth cover fields into groves and clearings.
+fn biome_color(dir: vec3<f32>, h: f32, slope: f32, pixel_m: f32) -> vec3<f32> {
     var c = sample_biome_albedo(dir);
-    let plants = sample_plants(dir);
+    var plants = sample_plants(dir);
+    let n_tree = detail_noise(dir, pixel_m, 7u);
+    let n_ground = detail_noise(dir, pixel_m, 91u);
+    plants.r = clamp(plants.r + n_ground * 1.2, 0.0, 1.0);
+    plants.g = clamp(plants.g + (n_ground - n_tree) * 0.8, 0.0, 1.0);
+    plants.b = clamp(plants.b + n_tree * 1.4, 0.0, 1.0);
+
     let temp = sample_field(TEMPERATURE, dir);
     // Cold forests are dark conifers; warm ones a brighter, more saturated green.
     let warm = smoothstep(5.0, 22.0, temp);
-    let grass = mix(vec3(0.33, 0.40, 0.17), vec3(0.27, 0.44, 0.11), warm);
+    // Grass varies between lush and dry patches.
+    let lush = mix(vec3(0.33, 0.40, 0.17), vec3(0.27, 0.44, 0.11), warm);
+    let grass = mix(lush, vec3(0.45, 0.42, 0.24), clamp(0.5 + n_tree * 2.5, 0.0, 1.0) * 0.8);
     let shrub = vec3(0.26, 0.31, 0.14);
     let tree = mix(vec3(0.05, 0.13, 0.08), vec3(0.06, 0.22, 0.05), warm);
     c = mix(c, grass, clamp(plants.r, 0.0, 1.0));
     c = mix(c, shrub, clamp(plants.g, 0.0, 1.0));
     c = mix(c, tree, clamp(plants.b, 0.0, 1.0));
+    c *= 0.9 + 1.0 * n_ground;
     // Beaches, bare rock on steep slopes, snow where it is cold enough.
     c = mix(vec3(0.76, 0.70, 0.50), c, smoothstep(2.0, 30.0, h));
     c = mix(c, vec3(0.35, 0.30, 0.27), smoothstep(0.35, 0.6, slope));
@@ -209,18 +240,69 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if dot(local_n, dir) < 0.0 {
         local_n = -local_n;
     }
-    let slope = 1.0 - dot(local_n, dir);
     let world_n = normalize(mesh_normal_local_to_world(local_n, in.instance_index));
+    let pixel_m = length(fwidth(in.world_position.xyz));
+    return shade(dir, h, 1.0 - dot(local_n, dir), world_n, in.world_position, in.clip_position, pixel_m);
+}
 
+struct TerrainVertex {
+    @builtin(instance_index) instance_index: u32,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    // Unit direction from the planet centre, and height above sea level in metres.
+    @location(2) surface: vec4<f32>,
+};
+
+struct TerrainOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) surface: vec4<f32>,
+};
+
+@vertex
+fn terrain_vertex(in: TerrainVertex) -> TerrainOutput {
+    let world_from_local = get_world_from_local(in.instance_index);
+    let world = mesh_position_local_to_world(world_from_local, vec4(in.position, 1.0));
+    var out: TerrainOutput;
+    out.clip_position = position_world_to_clip(world.xyz);
+    out.world_position = world;
+    out.world_normal = mesh_normal_local_to_world(in.normal, in.instance_index);
+    out.surface = in.surface;
+    return out;
+}
+
+@fragment
+fn terrain_fragment(in: TerrainOutput) -> @location(0) vec4<f32> {
+    let dir = normalize(in.surface.xyz);
+    // Chunks are only translated, so world and planet-local normals agree.
+    let n = normalize(in.world_normal);
+    let pixel_m = length(fwidth(in.world_position.xyz));
+    return shade(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.clip_position, pixel_m);
+}
+
+// Surface colour and lighting for a point at `dir` with height `h` (m above sea level).
+// `slope` is 1 - cos(angle from vertical); `pixel_m` is the footprint of a pixel in metres.
+fn shade(
+    dir: vec3<f32>,
+    h: f32,
+    slope: f32,
+    world_n: vec3<f32>,
+    world_position: vec4<f32>,
+    clip_position: vec4<f32>,
+    pixel_m: f32,
+) -> vec4<f32> {
     var pbr: PbrInput = pbr_input_new();
     var color = terrain_color(h, slope * 8.0, abs(dir.y));
     if h >= 0.0 && material.show_biomes > 0.5 {
-        color = biome_color(dir, h, slope * 8.0);
+        color = biome_color(dir, h, slope * 8.0, pixel_m);
     }
     var roughness = select(0.85, 0.12, h < 0.0);
     if h >= 0.0 {
-        // Rivers and lakes: strong flow or standing water on land.
-        let river = smoothstep(material.river_discharge, material.river_discharge * 4.0, sample_field(DISCHARGE, dir));
+        // Rivers and lakes: strong flow or standing water on land. The fields are ~20 km
+        // texels, so rivers fade out up close instead of drawing as wide blue bands.
+        let river_scale = smoothstep(800.0, 4000.0, pixel_m);
+        let river = river_scale * smoothstep(material.river_discharge * 2.0, material.river_discharge * 6.0, sample_field(DISCHARGE, dir));
         let lake = smoothstep(20.0, 60.0, sample_field(WATER, dir));
         let wet = max(river, lake);
         color = mix(color, vec3(0.04, 0.16, 0.24), wet);
@@ -230,16 +312,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if h >= 0.0 && material.show_biomes > 0.5 {
         // Wildfires glow; bright enough to see on the night side.
         let fire = sample_field(FIRE, dir);
-        pbr.material.emissive = vec4(vec3(4000.0, 1100.0, 150.0) * fire, 1.0);
+        pbr.material.emissive = vec4(vec3(60000.0, 17000.0, 2400.0) * fire, 1.0);
     }
     pbr.material.perceptual_roughness = roughness;
     pbr.material.metallic = 0.0;
-    pbr.frag_coord = in.clip_position;
-    pbr.world_position = in.world_position;
+    pbr.frag_coord = clip_position;
+    pbr.world_position = world_position;
     pbr.world_normal = world_n;
     pbr.N = world_n;
     pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
-    pbr.V = fns::calculate_view(in.world_position, pbr.is_orthographic);
+    pbr.V = fns::calculate_view(world_position, pbr.is_orthographic);
 
     return tone_mapping(fns::apply_pbr_lighting(pbr), view.color_grading);
 }

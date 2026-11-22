@@ -1,0 +1,13 @@
+planet seed 7, 512x512x6 texels, loaded from cache; live step 608
+    height: min  -4595.29  max   5942.44  mean    79.143  >0  57.37%  non-finite 0
+     water: min      0.00  max   4595.29  mean   583.824  >0 100.00%  non-finite 0
+ discharge: min      0.00  max      2.31  mean     0.051  >0  58.81%  non-finite 0
+  moisture: min      0.03  max      1.00  mean     0.774  >0 100.00%  non-finite 0
+temperature: min    -51.94  max     28.00  mean    11.375  >0  81.99%  non-finite 0
+     biome: min      0.00  max     10.00  mean     3.461  >0  57.37%  non-finite 0
+     grass: min      0.00  max      0.88  mean     0.162  >0  51.52%  non-finite 0
+    shrubs: min      0.00  max      0.80  mean     0.166  >0  48.76%  non-finite 0
+     trees: min      0.00  max      1.00  mean     0.276  >0  41.15%  non-finite 0
+      fuel: min      0.00  max      1.02  mean     0.240  >0  51.52%  non-finite 0
+      fire: min      0.00  max      0.89  mean     0.000  >0   0.05%  non-finite 0
+biomes: ocean 42.6%, lake 0.6%, ice 5.3%, tundra 7.9%, desert 0.7%, boreal forest 6.6%, grassland 12.4%, temperate forest 9.3%, shrubland 1.5%, tropical forest 7.1%, savanna 6.0%
