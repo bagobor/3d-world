@@ -31,7 +31,7 @@ jobs:
       - name: Headless simulation smoke test
         env:
           WGPU_BACKEND: vulkan
-        run: cargo run -- --headless --steps 64 --steps-per-frame 16 --resolution 256 --out out
+        run: cargo run -- --headless --steps 256 --steps-per-frame 32 --resolution 256 --out out
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -10,22 +10,25 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 
 ## Status
 
-Step 1 of the plan: the app skeleton and a reusable GPU simulation framework, exercised by a
-procedural heightfield and a thermal-erosion pass. Next: hydraulic erosion, climate,
-vegetation, animals, terrain LOD, atmosphere.
+- Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
+  heightfield and thermal erosion.
+- Step 2: hydraulic erosion. Rain, pipe-model water flow, sediment transport, erosion and
+  deposition carve drainage networks, lakes and deltas (screenshot: 3000 steps at 512²).
+
+Next: climate, vegetation, animals, terrain LOD, atmosphere.
 
 ## Running
 
 ```sh
 cargo run --release                  # window: drag to orbit, scroll to zoom
 cargo run --release -- --help        # options
-cargo run --release -- --headless --steps 400 --out out   # no window: writes out/planet.png
+cargo run --release -- --headless --steps 2000 --out out  # no window: writes out/planet.png
 ```
 
 Keys: **Space** pause, **R** new planet (next seed), **Up/Down** simulation steps per frame.
 
-Headless mode renders to an offscreen image, saves `planet.png` and `height_stats.txt`, and
-exits. It works on a software Vulkan driver (Mesa lavapipe), which is what CI uses.
+Headless mode renders to an offscreen image, saves `planet.png` and `stats.txt` (min/max/mean
+of every field, plus the terrain + sediment total, which erosion must conserve), and exits. It works on a software Vulkan driver (Mesa lavapipe), which is what CI uses.
 
 ## Layout
 
@@ -39,6 +42,7 @@ src/planet/       the planet: declares fields + passes, renders from them
 assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
+  planet/hydro_*.wesl     hydraulic erosion passes
   planet/planet_material.wesl   displaces + shades the planet from the height field
 ```
 
@@ -81,6 +85,24 @@ Shader contract, all in `@group(0)`:
 Dispatch is `@workgroup_size(8, 8, 1)` over `res × res × 6`, with `global_invocation_id.z` as
 the cube face. `neighbor_texel` in `sim/common.wesl` steps across cube edges, so stencils
 work seamlessly over the whole sphere.
+
+### Hydraulic erosion
+
+Fields: `water` (depth, m), `sediment` (suspended, m of rock), `flux` (outflow to the 4
+neighbours, rgba), `discharge` (smoothed inflow, high along rivers). Per step:
+
+1. `hydro_flux`: pipe model (Mei et al. 2007). Outflow grows with the water-surface
+   difference to each neighbour and is scaled so a cell never sends more than it holds.
+2. `hydro_water`: apply fluxes, move sediment with the same fractions as water, add rain,
+   evaporate; oceans hold their surface at sea level and act as the sink.
+3. `hydro_erode`: sediment capacity = `capacity × discharge × slope`. Below it the water
+   digs (never below the lowest neighbour), above it drops sediment.
+
+Material only moves between `height` and `sediment`, so their sum is conserved; the headless
+report shows it (drift ~0.001 m over 3000 steps from float rounding). Fluxes are stored in
+each cell's own face frame, and `reverse_direction` in `common.wesl` finds the matching slot
+across rotated cube faces, so rivers cross face edges seamlessly. Constants live in
+`HydroParams` and are tuned for geological time at planet scale, not real-world units.
 
 ### Single queue
 
