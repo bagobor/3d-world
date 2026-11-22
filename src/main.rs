@@ -298,6 +298,11 @@ fn headless_capture(
             };
             info!("headless: frame {}, {phase} step {}", *frames, stats.step());
         }
+        if stats.failed() {
+            error!("headless: a simulation pass failed to compile");
+            exit.write(AppExit::error());
+            return;
+        }
         let saved = !cache.enabled() || cache.saved_generations() >= stats.generations_completed();
         if !stats.live() || !saved || stats.step() < args.steps {
             if *frames > 200_000 {
@@ -315,13 +320,16 @@ fn headless_capture(
         take_screenshot(&mut commands, &target, &args);
 
         let resolution = args.resolution;
-        for name in REPORTED_FIELDS {
+        for (field, channels) in REPORTED_FIELDS {
             commands
-                .spawn(ReadbackOnce::texture(fields.front(name)))
+                .spawn(ReadbackOnce::texture(fields.front(field)))
                 .observe(
                     move |event: On<ReadbackComplete>, mut done: ResMut<CaptureDone>| {
-                        done.fields
-                            .push((name, FieldStats::from_r32(&event.data, resolution)));
+                        for (c, &name) in channels.iter().enumerate() {
+                            let s =
+                                FieldStats::from_texels(&event.data, resolution, channels.len(), c);
+                            done.fields.push((name, s));
+                        }
                     },
                 );
         }
@@ -364,15 +372,21 @@ fn take_screenshot(commands: &mut Commands, target: &CaptureTarget, args: &Args)
     );
 }
 
-/// R32Float fields summarised at the end of a headless run.
-const REPORTED_FIELDS: [&str; 6] = [
-    planet::HEIGHT,
-    planet::WATER,
-    planet::DISCHARGE,
-    planet::MOISTURE,
-    planet::TEMPERATURE,
-    planet::BIOME,
+/// Fields summarised at the end of a headless run, with a report name per channel.
+const REPORTED_FIELDS: [(&str, &[&str]); 8] = [
+    (planet::HEIGHT, &[planet::HEIGHT]),
+    (planet::WATER, &[planet::WATER]),
+    (planet::DISCHARGE, &[planet::DISCHARGE]),
+    (planet::MOISTURE, &[planet::MOISTURE]),
+    (planet::TEMPERATURE, &[planet::TEMPERATURE]),
+    (planet::BIOME, &[planet::BIOME]),
+    (planet::PLANTS, &["grass", "shrubs", "trees", "fuel"]),
+    (planet::FIRE, &[planet::FIRE]),
 ];
+
+fn reported_channels() -> usize {
+    REPORTED_FIELDS.iter().map(|(_, c)| c.len()).sum()
+}
 
 #[derive(Resource, Default)]
 struct CaptureDone {
@@ -389,7 +403,7 @@ fn exit_when_captured(
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(done) = done else { return };
-    if !done.screenshot || done.fields.len() < REPORTED_FIELDS.len() {
+    if !done.screenshot || done.fields.len() < reported_channels() {
         return;
     }
     let get = |name: &str| done.fields.iter().find(|(n, _)| *n == name).map(|(_, s)| s);
@@ -404,10 +418,10 @@ fn exit_when_captured(
         stats.step(),
         r = args.resolution
     );
-    for name in REPORTED_FIELDS {
+    for name in REPORTED_FIELDS.iter().flat_map(|(_, c)| c.iter()) {
         let s = get(name).unwrap();
         report += &format!(
-            "{name:>10}: min {:>9.2}  max {:>9.2}  mean {:>9.3}  >0 {:>5.1}%  non-finite {}\n",
+            "{name:>10}: min {:>9.2}  max {:>9.2}  mean {:>9.3}  >0 {:>6.2}%  non-finite {}\n",
             s.min,
             s.max,
             s.mean(),
@@ -454,10 +468,12 @@ struct FieldStats {
 }
 
 impl FieldStats {
-    /// Summarises an R32Float cube-sphere readback (rows padded to 256 bytes).
-    fn from_r32(data: &[u8], resolution: u32) -> Self {
+    /// Summarises one channel of a 32-bit float cube-sphere readback with `channels`
+    /// channels per texel (rows padded to 256 bytes).
+    fn from_texels(data: &[u8], resolution: u32, channels: usize, channel: usize) -> Self {
         let res = resolution as usize;
-        let row = (res * 4).next_multiple_of(256);
+        let texel = 4 * channels;
+        let row = (res * texel).next_multiple_of(256);
         let mut s = FieldStats {
             min: f32::INFINITY,
             max: f32::NEG_INFINITY,
@@ -467,10 +483,11 @@ impl FieldStats {
             for y in 0..res {
                 let start = (layer * res + y) * row;
                 let bytes = data
-                    .get(start..start + res * 4)
+                    .get(start..start + res * texel)
                     .expect("readback shorter than the field");
-                for v in bytes.as_chunks::<4>().0 {
-                    let x = f32::from_le_bytes(*v);
+                for t in bytes.chunks_exact(texel) {
+                    let v = &t[channel * 4..channel * 4 + 4];
+                    let x = f32::from_le_bytes(v.try_into().unwrap());
                     if !x.is_finite() {
                         s.non_finite += 1;
                         continue;

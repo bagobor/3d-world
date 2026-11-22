@@ -447,6 +447,7 @@ struct SimStatsInner {
     ready: AtomicU64,
     generating: AtomicU64,
     generations_completed: AtomicU64,
+    failed: AtomicU64,
 }
 
 impl SimStats {
@@ -478,6 +479,15 @@ impl SimStats {
     /// True once the planet exists: generated, or loaded from the cache.
     pub fn live(&self) -> bool {
         self.ready() && !self.generating()
+    }
+
+    /// A pass failed to compile; the simulation will never start.
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Relaxed) != 0
+    }
+
+    pub(crate) fn set_failed(&self) {
+        self.0.failed.store(1, Ordering::Relaxed);
     }
 
     pub(crate) fn publish(&self, step: u64, total: u64, ready: bool, generating: bool, gens: u64) {

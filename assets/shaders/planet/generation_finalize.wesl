@@ -2,7 +2,7 @@
 // derives the static temperature and biome maps the live simulation and renderer use.
 import super::super::sim::common::{SimGlobals, texel_to_dir};
 import super::env_params::{
-    EnvParams, BIOME_OCEAN, BIOME_LAKE, BIOME_ICE, BIOME_TUNDRA, BIOME_DESERT,
+    EnvParams, precipitation, BIOME_OCEAN, BIOME_LAKE, BIOME_ICE, BIOME_TUNDRA, BIOME_DESERT,
     BIOME_BOREAL_FOREST, BIOME_GRASSLAND, BIOME_TEMPERATE_FOREST, BIOME_SHRUBLAND,
     BIOME_TROPICAL_FOREST, BIOME_SAVANNA,
 };
@@ -47,13 +47,10 @@ fn generation_finalize(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let dir = texel_to_dir(id.z, vec2<f32>(id.xy) + 0.5, globals.inv_resolution);
     let lat = asin(clamp(dir.y, -1.0, 1.0));
-    let lat_deg = abs(lat) * 57.29578;
     let sea_temp = mix(params.pole_temp_c, params.equator_temp_c, cos(lat));
     let temp = sea_temp - params.lapse_rate_c_per_m * max(h, 0.0);
 
-    // Precipitation proxy: moisture, drier in the subtropical high-pressure belt.
-    let belt = exp(-pow((lat_deg - 27.0) / 9.0, 2.0));
-    let precip = textureLoad(moisture, p, layer, 0).r * (1.0 - params.subtropic_dryness * belt);
+    let precip = precipitation(textureLoad(moisture, p, layer, 0).r, dir, params.subtropic_dryness);
 
     textureStore(height_out, p, layer, vec4(h, 0.0, 0.0, 0.0));
     textureStore(temperature_out, p, layer, vec4(temp, 0.0, 0.0, 0.0));

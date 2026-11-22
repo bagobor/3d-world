@@ -30,3 +30,11 @@ const BIOME_SHRUBLAND: f32 = 8.0;
 const BIOME_TROPICAL_FOREST: f32 = 9.0;
 const BIOME_SAVANNA: f32 = 10.0;
 const BIOME_COUNT: u32 = 11u;
+
+// Precipitation proxy (0..1) for a surface direction: moisture, drier in the subtropical
+// high-pressure belt around 27° latitude.
+fn precipitation(moisture: f32, dir: vec3<f32>, subtropic_dryness: f32) -> f32 {
+    let lat_deg = abs(asin(clamp(dir.y, -1.0, 1.0))) * 57.29578;
+    let belt = exp(-pow((lat_deg - 27.0) / 9.0, 2.0));
+    return moisture * (1.0 - subtropic_dryness * belt);
+}

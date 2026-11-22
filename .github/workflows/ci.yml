@@ -35,7 +35,8 @@ jobs:
           cargo run -- --headless --generation-steps 256 --generation-steps-per-frame 32 \
             --resolution 256 --cache cache --out out 2>&1 | tee generate.log
           grep -q "sim cache: saved planet" generate.log
-          cargo run -- --headless --resolution 256 --cache cache --out out/reloaded 2>&1 \
+          cargo run -- --headless --steps 64 --steps-per-frame 16 --resolution 256 \
+            --cache cache --out out/reloaded 2>&1 \
             | tee reload.log
           grep -q "sim cache: loaded planet" reload.log
       - uses: actions/upload-artifact@v4

@@ -27,6 +27,8 @@ struct PlanetMaterialParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var discharge_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var temperature_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var biome_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var plants_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(7) var fire_tex: texture_2d_array<f32>;
 
 fn load_field(field: u32, t: vec3<u32>) -> f32 {
     let p = vec2<i32>(t.xy);
@@ -35,6 +37,7 @@ fn load_field(field: u32, t: vec3<u32>) -> f32 {
         case 2u: { return textureLoad(discharge_tex, p, i32(t.z), 0).r; }
         case 3u: { return textureLoad(temperature_tex, p, i32(t.z), 0).r; }
         case 4u: { return textureLoad(biome_tex, p, i32(t.z), 0).r; }
+        case 5u: { return textureLoad(fire_tex, p, i32(t.z), 0).r; }
         default: { return textureLoad(height_tex, p, i32(t.z), 0).r; }
     }
 }
@@ -44,21 +47,40 @@ const WATER: u32 = 1u;
 const DISCHARGE: u32 = 2u;
 const TEMPERATURE: u32 = 3u;
 const BIOME: u32 = 4u;
+const FIRE: u32 = 5u;
 
-// Ground albedo per biome class (see `env_params.wesl`).
+fn load_plants(t: vec3<u32>) -> vec4<f32> {
+    return textureLoad(plants_tex, vec2<i32>(t.xy), i32(t.z), 0);
+}
+
+// Bilinear plant cover (grass, shrub, tree, fuel), continuous across cube edges.
+fn sample_plants(dir: vec3<f32>) -> vec4<f32> {
+    let res = u32(material.resolution);
+    let face = dir_to_face(dir);
+    let st = dir_to_face_st(face, dir);
+    let c = (st * 0.5 + 0.5) * material.resolution - 0.5;
+    let base = floor(c);
+    let f = c - base;
+    let b = vec2<i32>(base);
+    let origin = vec3<u32>(vec2<u32>(clamp(b, vec2(0), vec2(i32(res) - 1))), face);
+    let d = b - vec2<i32>(origin.xy);
+    let p00 = load_plants(neighbor_texel(origin, d, res));
+    let p10 = load_plants(neighbor_texel(origin, d + vec2(1, 0), res));
+    let p01 = load_plants(neighbor_texel(origin, d + vec2(0, 1), res));
+    let p11 = load_plants(neighbor_texel(origin, d + vec2(1, 1), res));
+    return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+}
+
+// Bare ground albedo per biome class (see `env_params.wesl`); plants are drawn over it.
 fn biome_albedo(biome: f32) -> vec3<f32> {
     switch u32(biome + 0.5) {
         case 0u: { return vec3(0.02, 0.08, 0.15); }  // ocean (not used on land)
         case 1u: { return vec3(0.04, 0.16, 0.24); }  // lake
         case 2u: { return vec3(0.90, 0.92, 0.96); }  // ice
-        case 3u: { return vec3(0.42, 0.42, 0.33); }  // tundra
-        case 4u: { return vec3(0.80, 0.68, 0.46); }  // desert
-        case 5u: { return vec3(0.10, 0.22, 0.12); }  // boreal forest
-        case 6u: { return vec3(0.45, 0.52, 0.24); }  // grassland
-        case 7u: { return vec3(0.15, 0.32, 0.10); }  // temperate forest
-        case 8u: { return vec3(0.50, 0.47, 0.30); }  // shrubland
-        case 9u: { return vec3(0.06, 0.25, 0.05); }  // tropical forest
-        default: { return vec3(0.60, 0.55, 0.28); }  // savanna
+        case 3u: { return vec3(0.40, 0.38, 0.32); }  // tundra: stony
+        case 4u: { return vec3(0.80, 0.66, 0.44); }  // desert: sand
+        case 9u, 10u: { return vec3(0.55, 0.34, 0.22); }  // tropical: red soil
+        default: { return vec3(0.42, 0.34, 0.24); }  // brown soil
     }
 }
 
@@ -134,9 +156,19 @@ fn vertex(in: Vertex) -> VertexOutput {
     return out;
 }
 
-// Land colour from the baked biome and temperature maps.
+// Land colour: bare ground by biome, then grass, shrubs and trees by their live cover.
 fn biome_color(dir: vec3<f32>, h: f32, slope: f32) -> vec3<f32> {
     var c = sample_biome_albedo(dir);
+    let plants = sample_plants(dir);
+    let temp = sample_field(TEMPERATURE, dir);
+    // Cold forests are dark conifers; warm ones a brighter, more saturated green.
+    let warm = smoothstep(5.0, 22.0, temp);
+    let grass = mix(vec3(0.33, 0.40, 0.17), vec3(0.27, 0.44, 0.11), warm);
+    let shrub = vec3(0.26, 0.31, 0.14);
+    let tree = mix(vec3(0.05, 0.13, 0.08), vec3(0.06, 0.22, 0.05), warm);
+    c = mix(c, grass, clamp(plants.r, 0.0, 1.0));
+    c = mix(c, shrub, clamp(plants.g, 0.0, 1.0));
+    c = mix(c, tree, clamp(plants.b, 0.0, 1.0));
     // Beaches, bare rock on steep slopes, snow where it is cold enough.
     c = mix(vec3(0.76, 0.70, 0.50), c, smoothstep(2.0, 30.0, h));
     c = mix(c, vec3(0.35, 0.30, 0.27), smoothstep(0.35, 0.6, slope));
@@ -195,6 +227,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         roughness = mix(roughness, 0.1, wet);
     }
     pbr.material.base_color = vec4(color, 1.0);
+    if h >= 0.0 && material.show_biomes > 0.5 {
+        // Wildfires glow; bright enough to see on the night side.
+        let fire = sample_field(FIRE, dir);
+        pbr.material.emissive = vec4(vec3(4000.0, 1100.0, 150.0) * fire, 1.0);
+    }
     pbr.material.perceptual_roughness = roughness;
     pbr.material.metallic = 0.0;
     pbr.frag_coord = in.clip_position;
