@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use bevy::{
     asset::RenderAssetUsages,
-    light::NotShadowCaster,
     math::{DVec2, DVec3},
     mesh::{Indices, MeshVertexAttribute, PrimitiveTopology},
     platform::collections::HashMap,
@@ -321,7 +320,6 @@ pub fn update_terrain(
                     MeshMaterial3d(material.clone()),
                     Transform::default(),
                     Visibility::Hidden,
-                    NotShadowCaster,
                     TerrainChunk {
                         center: chunk.center,
                     },

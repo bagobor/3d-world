@@ -65,6 +65,8 @@ struct Args {
     exaggeration: f64,
     /// Headless: capture only these views (all when empty).
     views: Vec<String>,
+    /// Sun shadow maps (off for weak GPUs).
+    shadows: bool,
 }
 
 impl Args {
@@ -83,6 +85,7 @@ impl Args {
             view: (0.6, 0.35, 3.2),
             exaggeration: 1.0,
             views: Vec::new(),
+            shadows: true,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -110,6 +113,7 @@ impl Args {
                 "--pitch" => args.view.1 = value().parse().expect("--pitch"),
                 "--distance" => args.view.2 = value().parse().expect("--distance"),
                 "--exaggeration" => args.exaggeration = value().parse().expect("--exaggeration"),
+                "--no-shadows" => args.shadows = false,
                 "--views" => args.views = value().split(',').map(str::to_owned).collect(),
                 "-h" | "--help" => {
                     println!(
@@ -118,7 +122,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow,herd]"
+                         [--views planet,orbit,surface,forest,meadow,herd] [--no-shadows]"
                     );
                     std::process::exit(0);
                 }
@@ -204,8 +208,19 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
     commands.spawn((
         DirectionalLight {
             illuminance: bevy::light::light_consts::lux::DIRECT_SUNLIGHT,
+            shadow_maps_enabled: args.shadows,
             ..default()
         },
+        // Shadows from a blade's length to the hills a few km away: the first cascade is
+        // small for animals and shrubs, the last reaches mountain shadows.
+        bevy::light::CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            minimum_distance: 0.3,
+            first_cascade_far_bound: 40.0,
+            maximum_distance: 6_000.0,
+            overlap_proportion: 0.2,
+        }
+        .build(),
         Transform::from_xyz(4.0, 1.5, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     // Physical units: full sunlight and a daylight exposure. Skylight comes from the

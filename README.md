@@ -50,9 +50,13 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
   proportion to the live population densities; herds graze and keep together, flee from
   predators, and predators hunt.
 
+- Step 10: lighting polish. Sun shadows (cascaded shadow maps out to 6 km) cast by the
+  terrain, trees, shrubs and animals, received by everything; plants cast shadows grown in
+  exactly as drawn.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: lighting polish.
+The plan's steps are all in; what's next is open.
 
 ## Running
 
@@ -107,7 +111,8 @@ assets/shaders/
   planet/animal_params.wesl, animals_*.wesl               live animal populations
   planet/planet_material.wesl   displaces + shades the planet from the height field
   planet/clouds.wesl, cloud_field.wesl                    cloud shell and cloud shadows
-  planet/vegetation.wesl        grows, sways and shades vegetation
+  planet/vegetation*.wesl       grows, sways and shades vegetation (+ its shadow pass)
+  planet/terrain_prepass.wesl   terrain shadow pass
 ```
 
 ## The simulation framework
@@ -285,6 +290,19 @@ level per layer:
   where the terrain colour (which already shows plant cover) takes over.
 - **Shading**: colour by type, temperature and dryness, darker inside canopies, wind sway that
   bends tall parts most, PBR lighting and cloud shadows. No shadow maps yet.
+
+### Lighting
+
+- **Sun**: 100 klx directional light with four shadow cascades, from 40 cm to 6 km (first
+  cascade ends at 40 m, so animals and shrubs get crisp shadows; the last reaches hills).
+  Sky light comes from the atmosphere's environment map, so shadows are sky-blue.
+  `--no-shadows` turns shadow maps off for weak GPUs.
+- **Casters**: terrain chunks and vegetation have their own shadow-pass vertex shaders
+  (`terrain_prepass.wesl`, `vegetation_prepass.wesl`): Bevy's default prepass would not know
+  the chunk layout, and would draw every plant at full size. Vegetation grows in by the
+  same `plant_scale()` (`vegetation_common.wesl`) as in the main pass. Grass does not cast.
+- **Receivers**: the custom terrain and vegetation shaders build their own `PbrInput`; they
+  set the shadow-receiver flag that `pbr_input_new()` leaves clear.
 
 ### Hydraulic erosion
 

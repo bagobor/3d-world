@@ -738,6 +738,11 @@ impl Material for TerrainMaterial {
         "shaders/planet/planet_material.wesl".into()
     }
 
+    // Terrain casts shadows (mountains, hills).
+    fn prepass_vertex_shader() -> ShaderRef {
+        "shaders/planet/terrain_prepass.wesl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "shaders/planet/planet_material.wesl".into()
     }
