@@ -42,10 +42,20 @@ cargo run --release -- --headless --out out  # no window: writes out/planet.png
 cargo run --release -- --seed 3 --regenerate  # ignore the cached planet, generate again
 ```
 
-Mouse: **left-drag** moves over the planet, **right-drag** looks around, **scroll** changes
-altitude (from 20 planet radii down to eye height). Keys: **WASD** fly (**Shift** faster),
-**Space** pause, **R** generate a new planet (next seed), **Up/Down** live simulation steps
-per frame.
+Camera modes, switched with **1 / 2 / 3**:
+
+- **1 Orbit** (default): **left-drag** moves over the planet, **right-drag** looks around,
+  **scroll** changes altitude (from 20 planet radii down to eye height), **WASD** moves
+  (**Shift** faster).
+- **2 Fly**: free flight. **Left-click** captures the mouse for looking around (**Esc**
+  releases it; **right-drag** also looks). **WASD** flies along the view, **E/Q** up and
+  down, **Shift** faster, **scroll** sets the speed. Speed grows with height above the
+  ground, from 15 m/s near it to hundreds of km/s in space.
+- **3 Walk**: on foot at 1.7 m eye height, following the terrain (on the ocean, on its
+  surface). Mouse look as in fly mode, **WASD** walks, **Shift** runs, **Space** jumps.
+
+Other keys: **Space** (or **P**; only **P** while walking) pauses the simulation, **R**
+generates a new planet (next seed), **Up/Down** live simulation steps per frame.
 
 The first start with a given seed and resolution generates the planet
 (`--generation-steps`, default 3000) and writes it to `cache/planet-v1-seed<seed>-res<res>.bin`

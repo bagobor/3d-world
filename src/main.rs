@@ -241,8 +241,15 @@ fn set_initial_view(args: Res<Args>, mut camera: ResMut<PlanetCamera>) {
     *camera = initial_view(&args, camera.radius_m);
 }
 
-fn keyboard_controls(keys: Res<ButtonInput<KeyCode>>, mut control: ResMut<SimControl>) {
-    if keys.just_pressed(KeyCode::Space) {
+fn keyboard_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    camera: Res<PlanetCamera>,
+    mut control: ResMut<SimControl>,
+) {
+    // Space jumps when walking; P pauses in every mode.
+    let pause = keys.just_pressed(KeyCode::KeyP)
+        || (keys.just_pressed(KeyCode::Space) && camera.mode != camera::CameraMode::Walk);
+    if pause {
         control.paused = !control.paused;
     }
     if keys.just_pressed(KeyCode::KeyR) {
@@ -281,11 +288,12 @@ fn window_title(
         )
     } else {
         format!(
-            "planet-sim | seed {} | step {} | {} steps/frame{} | {altitude} up | {} chunks | {fps:.0} fps",
+            "planet-sim | seed {} | step {} | {} steps/frame{} | {} | {altitude} up | {} chunks | {fps:.0} fps",
             control.seed,
             stats.step(),
             control.steps_per_frame,
             if control.paused { " (paused)" } else { "" },
+            camera.mode.name(),
             lod.drawn(),
         )
     };
