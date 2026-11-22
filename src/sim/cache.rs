@@ -1,7 +1,8 @@
-//! Disk cache for generated planets.
+//! Baked fields on the CPU, and the disk cache for generated planets.
 //!
 //! When the generate phase finishes, every field marked with [`SimGraph::bake`] is read back
-//! from the GPU and written to `<dir>/<tag>-seed<seed>-res<res>.bin`. On start-up the same
+//! from the GPU into [`BakedFields`] (CPU-side consumers such as the LOD terrain read them
+//! there) and, if the cache is enabled, written to `<dir>/<tag>-seed<seed>-res<res>.bin`. On start-up the same
 //! file, if present and valid, is uploaded straight into the field textures and generation is
 //! skipped. `tag` names the generator version: bump it whenever generation changes, so stale
 //! planets are not loaded.
@@ -33,6 +34,48 @@ pub struct CacheConfig {
     pub tag: String,
     /// Load an existing file. `false` always generates (and overwrites the file).
     pub reuse: bool,
+}
+
+/// CPU copy of the current planet's baked fields: tightly packed texels for the 6 cube faces
+/// in order, one entry per baked field. Filled after generation or a cache load; `version`
+/// changes every time the planet does.
+#[derive(Resource, Default)]
+pub struct BakedFields {
+    pub resolution: u32,
+    pub seed: u32,
+    pub version: u64,
+    pub fields: HashMap<&'static str, Vec<u8>>,
+}
+
+impl BakedFields {
+    pub fn ready(&self) -> bool {
+        self.version > 0
+    }
+
+    /// A baked R32Float field as floats.
+    pub fn f32_field(&self, name: &str) -> Option<Vec<f32>> {
+        let bytes = self.fields.get(name)?;
+        Some(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+        )
+    }
+
+    pub(super) fn set(
+        &mut self,
+        resolution: u32,
+        seed: u32,
+        fields: HashMap<&'static str, Vec<u8>>,
+    ) {
+        self.resolution = resolution;
+        self.seed = seed;
+        self.fields = fields;
+        self.version += 1;
+    }
 }
 
 #[derive(Resource)]
@@ -200,7 +243,8 @@ fn unpad(data: &[u8], resolution: u32, texel_bytes: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// After each finished generation, reads back the baked fields and writes the cache file.
+/// After each finished generation, reads back the baked fields into [`BakedFields`] and
+/// writes the cache file.
 pub(super) fn save_baked_fields(
     mut commands: Commands,
     graph: Res<SimGraph>,
@@ -208,10 +252,8 @@ pub(super) fn save_baked_fields(
     stats: Res<SimStats>,
     control: Res<SimControl>,
     mut cache: ResMut<SimCache>,
+    mut baked: ResMut<BakedFields>,
 ) {
-    if !cache.enabled() {
-        return;
-    }
     let Some(fields) = fields else { return };
 
     // A generation just finished: request readbacks of every baked field.
@@ -238,11 +280,15 @@ pub(super) fn save_baked_fields(
         }
     }
 
-    // All readbacks in: write the file.
+    // All readbacks in: publish them and write the file.
     if cache.saved < cache.requested && cache.pending.len() == graph.baked.len() {
         let seed = cache.pending_seed;
-        let path = cache.path(graph.resolution, seed).unwrap();
         let pending = std::mem::take(&mut cache.pending);
+        baked.set(graph.resolution, seed, pending.iter().cloned().collect());
+        cache.saved = cache.requested;
+        let Some(path) = cache.path(graph.resolution, seed) else {
+            return;
+        };
         match write_file(&path, graph.resolution, seed, &pending, &graph) {
             Ok(()) => {
                 let bytes: usize = pending.iter().map(|(_, d)| d.len()).sum();
@@ -255,7 +301,6 @@ pub(super) fn save_baked_fields(
             }
             Err(err) => error!("sim cache: could not write {}: {err}", path.display()),
         }
-        cache.saved = cache.requested;
     }
 }
 
