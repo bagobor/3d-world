@@ -503,7 +503,7 @@ fn take_screenshot(commands: &mut Commands, target: &CaptureTarget, args: &Args,
 }
 
 /// Fields summarised at the end of a headless run, with a report name per channel.
-const REPORTED_FIELDS: [(&str, &[&str]); 8] = [
+const REPORTED_FIELDS: [(&str, &[&str]); 9] = [
     (planet::HEIGHT, &[planet::HEIGHT]),
     (planet::WATER, &[planet::WATER]),
     (planet::DISCHARGE, &[planet::DISCHARGE]),
@@ -512,6 +512,10 @@ const REPORTED_FIELDS: [(&str, &[&str]); 8] = [
     (planet::BIOME, &[planet::BIOME]),
     (planet::PLANTS, &["grass", "shrubs", "trees", "fuel"]),
     (planet::FIRE, &[planet::FIRE]),
+    (
+        planet::ANIMALS,
+        &["grazers", "predators", "grass_eaten", "shrub_eaten"],
+    ),
 ];
 
 fn reported_channels() -> usize {
