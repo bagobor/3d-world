@@ -62,9 +62,10 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves three views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves five views, `planet.png` (whole planet),
 `orbit.png` (low orbit) and `surface.png` (40 m above hilly land near the middle of the first
-view), each once its terrain detail has streamed in, plus `stats.txt` (min/max/mean of every
+view), `fly.png` (fly mode, 600 m up) and `walk.png` (walk mode, eye height), each once its
+terrain detail has streamed in, plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.

@@ -427,7 +427,24 @@ fn shots(
     ground.heading = 0.5;
     ground.pitch = -0.12;
     ground.altitude_m = surface.height(target, 1.0).max(0.0) + 40.0;
-    vec![("planet", *start), ("orbit", orbit), ("surface", ground)]
+    // The other camera modes: flying low over the land, and walking on it.
+    let mut fly = *start;
+    fly.dir = target;
+    fly.heading = 2.2;
+    fly.pitch = -0.25;
+    fly.altitude_m = surface.height(target, 1.0).max(0.0) + 600.0;
+    fly.mode = camera::CameraMode::Fly;
+    let mut walk = fly;
+    walk.pitch = 0.02;
+    walk.altitude_m = surface.height(target, 1.0).max(0.0) + camera::WALK_EYE_HEIGHT_M;
+    walk.mode = camera::CameraMode::Walk;
+    vec![
+        ("planet", *start),
+        ("orbit", orbit),
+        ("surface", ground),
+        ("fly", fly),
+        ("walk", walk),
+    ]
 }
 
 /// Saves `<name>.png` once the planet is on screen. A loaded planet is ready before its
