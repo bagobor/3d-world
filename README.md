@@ -40,9 +40,13 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 - Step 7: vegetation. Grass, shrubs and trees as real geometry near the camera, placed per
   biome and grown in by the live ecosystem, so forests spread and burn on screen.
 
+- Step 8: animal populations. Grazers and predators live on the plant ecosystem: they feed,
+  breed, die, migrate towards food and are killed by wildfire; grazing thins the plant
+  cover.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: animals (simulation, then rendering), lighting polish.
+Next: animal rendering, lighting polish.
 
 ## Running
 
@@ -104,6 +108,7 @@ assets/shaders/
   planet/hydro_*.wesl     hydraulic erosion passes
   planet/moisture_spread.wesl, generation_finalize.wesl   environment maps + biomes
   planet/plants_*.wesl, fire_spread.wesl                  live plant ecosystem
+  planet/animal_params.wesl, animals_*.wesl               live animal populations
   planet/planet_material.wesl   displaces + shades the planet from the height field
   planet/clouds.wesl, cloud_field.wesl                    cloud shell and cloud shadows
   planet/vegetation.wesl        grows, sways and shades vegetation
@@ -192,6 +197,27 @@ fires burn) and `fire` (intensity burning this step). One live step is roughly a
 
 Constants are in `PlantParams`. The planet material draws bare ground by biome, then grass,
 shrubs and trees by cover, and fires as an emissive glow.
+
+### Animal populations
+
+Field `animals`: r = grazers, g = predators (population density; about 1 is what the best
+pasture feeds), b and a = grass and shrub cover eaten this step. Populations live on
+habitable land (not water or ice), which is also what bounds their migration. Per step
+(`animals_step`, before `plants_grow`):
+
+1. **Feeding**: grazers eat grass and some shrub cover with a saturating (Holling type II)
+   response; predators kill grazers the same way.
+2. **Breeding and death**: grazers grow with what they ate and die off at a base rate plus a
+   crowding term; predators grow with their kills. Together this is Lotka-Volterra with
+   logistic prey, so the two populations cycle and settle.
+3. **Migration**: random wandering (diffusion) plus movement up the gradient of food:
+   grazers towards plant cover and away from crowds, predators towards grazers.
+4. **Fire** kills half the animals in a fully burning texel; a trickle of grazers moves
+   into good empty pasture.
+
+`plants_grow` then takes what was eaten off the plant cover, so heavy grazing keeps
+grasslands short and herds move on. These are populations, not individuals: the renderer
+(next step) will draw individual animals near the camera from these densities.
 
 ### Level-of-detail terrain
 
