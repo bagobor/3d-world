@@ -3,7 +3,9 @@
 pub mod camera;
 pub mod lod;
 pub mod mesh;
+pub mod sky;
 pub mod surface;
+pub mod vegetation;
 
 use bevy::{
     light::NotShadowCaster,
@@ -24,6 +26,7 @@ use crate::sim::{
 use camera::{PlanetAnchor, PlanetCamera};
 use lod::{LodSettings, TerrainLod};
 use surface::{CubeField, DetailParams, PlanetSurface};
+use vegetation::{Vegetation, VegetationMaps, VegetationMaterial, VegetationParams};
 
 /// Terrain height in metres above the sea-level datum.
 pub const HEIGHT: &str = "height";
@@ -45,6 +48,9 @@ pub const BIOME: &str = "biome";
 pub const PLANTS: &str = "plants";
 /// Live fire intensity (0..1) burning this step.
 pub const FIRE: &str = "fire";
+/// Live animal populations: r grazers, g predators (density, ~1 = what the best pasture
+/// feeds), b grass and a shrub cover eaten this step.
+pub const ANIMALS: &str = "animals";
 
 /// Bump when generation changes, so cached planets from older generators are not loaded.
 pub const GENERATOR_VERSION: &str = "planet-v1";
@@ -109,6 +115,8 @@ const GENERATION_FINALIZE: &str = "generation_finalize";
 const PLANTS_INIT: &str = "plants_init";
 const PLANTS_GROW: &str = "plants_grow";
 const FIRE_SPREAD: &str = "fire_spread";
+const ANIMALS_INIT: &str = "animals_init";
+const ANIMALS_STEP: &str = "animals_step";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
 #[repr(C)]
@@ -256,6 +264,52 @@ impl Default for PlantParams {
     }
 }
 
+/// Mirrors `AnimalParams` in `shaders/planet/animal_params.wesl`, where the units are
+/// documented. One live step is about a month.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AnimalParams {
+    pub graze_rate: f32,
+    pub graze_half: f32,
+    pub grazer_gain: f32,
+    pub grazer_death: f32,
+    pub grazer_crowding: f32,
+    pub hunt_rate: f32,
+    pub hunt_half: f32,
+    pub predator_gain: f32,
+    pub predator_death: f32,
+    pub grazer_diffusion: f32,
+    pub grazer_taxis: f32,
+    pub predator_diffusion: f32,
+    pub predator_taxis: f32,
+    pub immigration: f32,
+    pub fire_kill: f32,
+    pub _pad: f32,
+}
+
+impl Default for AnimalParams {
+    fn default() -> Self {
+        Self {
+            graze_rate: 0.12,
+            graze_half: 0.2,
+            grazer_gain: 1.5,
+            grazer_death: 0.05,
+            grazer_crowding: 0.08,
+            hunt_rate: 0.25,
+            hunt_half: 0.3,
+            predator_gain: 0.3,
+            predator_death: 0.04,
+            grazer_diffusion: 0.04,
+            grazer_taxis: 0.15,
+            predator_diffusion: 0.06,
+            predator_taxis: 0.1,
+            immigration: 0.0005,
+            fire_kill: 0.5,
+            _pad: 0.0,
+        }
+    }
+}
+
 pub struct PlanetPlugin {
     /// Vertices along one cube-face edge of the preview mesh shown while generating.
     pub mesh_subdivisions: u32,
@@ -291,24 +345,32 @@ impl Plugin for PlanetPlugin {
         app.add_plugins((
             MaterialPlugin::<PlanetMaterial>::default(),
             MaterialPlugin::<TerrainMaterial>::default(),
+            MaterialPlugin::<CloudMaterial>::default(),
+            MaterialPlugin::<VegetationMaterial>::default(),
         ))
+        .init_resource::<Vegetation>()
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
             height_exaggeration: self.height_exaggeration,
         })
         .insert_resource(TerrainLod::new(self.terrain))
         .insert_resource(PlanetCamera::new(radius))
-        .add_systems(Startup, declare_simulation)
+        .add_systems(Startup, (declare_simulation, sky::spawn_atmosphere))
         .add_systems(PostStartup, spawn_planet.after(SimAllocate))
         .add_systems(
             Update,
             (
                 toggle_biome_view,
+                show_clouds,
                 load_terrain_surface,
                 camera::clamp_camera.after(CameraControl),
                 lod::update_terrain.after(camera::clamp_camera),
-                camera::apply_floating_origin.after(lod::update_terrain),
+                vegetation::update_vegetation.after(camera::clamp_camera),
+                camera::apply_floating_origin
+                    .after(lod::update_terrain)
+                    .after(vegetation::update_vegetation),
                 swap_preview_for_terrain.after(lod::update_terrain),
+                sky::adapt_atmosphere.after(camera::clamp_camera),
             ),
         );
     }
@@ -317,6 +379,10 @@ impl Plugin for PlanetPlugin {
 /// The terrain material, shared by every chunk.
 #[derive(Resource)]
 struct TerrainMaterialHandle(Handle<TerrainMaterial>);
+
+/// The vegetation material, shared by every vegetation tile.
+#[derive(Resource)]
+struct VegetationMaterialHandle(Handle<VegetationMaterial>);
 
 /// The GPU-displaced sphere shown while the planet is generating.
 #[derive(Component)]
@@ -328,10 +394,14 @@ fn load_terrain_surface(
     baked: Res<BakedFields>,
     control: Res<SimControl>,
     material: Option<Res<TerrainMaterialHandle>>,
+    vegetation_material: Option<Res<VegetationMaterialHandle>>,
     mut lod: ResMut<TerrainLod>,
+    mut vegetation: ResMut<Vegetation>,
     mut loaded: Local<u64>,
 ) {
-    let Some(material) = material else { return };
+    let (Some(material), Some(vegetation_material)) = (material, vegetation_material) else {
+        return;
+    };
     if !baked.ready() || baked.version == *loaded {
         return;
     }
@@ -350,6 +420,17 @@ fn load_terrain_surface(
     };
     info!("terrain: new planet surface (seed {})", baked.seed);
     lod.set_surface(&mut commands, surface, material.0.clone());
+    match (baked.f32_field(BIOME), baked.f32_field(TEMPERATURE)) {
+        (Some(biome), Some(temperature)) => vegetation.set_planet(
+            &mut commands,
+            lod.surface().unwrap().clone(),
+            VegetationMaps::new(baked.resolution, &biome, temperature),
+            vegetation_material.0.clone(),
+            lod.settings.exaggeration,
+            control.seed,
+        ),
+        _ => error!("vegetation: the baked planet has no biome or temperature map"),
+    }
 }
 
 /// Show the LOD terrain once it has something to draw; until then, the preview sphere.
@@ -376,6 +457,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
     let hydro = HydroParams::default();
     let env = EnvParams::default();
     let plants = PlantParams::default();
+    let animals = AnimalParams::default();
     let generate = |pass: SimPass| pass.phase(SimPhase::Generate);
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
@@ -388,6 +470,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         .add_field(BIOME, FieldFormat::R32Float)
         .add_field(PLANTS, FieldFormat::Rgba32Float)
         .add_field(FIRE, FieldFormat::R32Float)
+        .add_field(ANIMALS, FieldFormat::Rgba32Float)
         // Initial state.
         .add_pass(generate(
             SimPass::new(
@@ -506,6 +589,31 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         )
         .add_pass(
             SimPass::new(
+                ANIMALS_INIT,
+                "shaders/planet/animals_init.wesl",
+                "animals_init",
+            )
+            .read(BIOME)
+            .write(ANIMALS)
+            .trigger(PassTrigger::OnReset)
+            .with_params(animals),
+        )
+        // Animals feed first; plants_grow then takes what they ate off the cover.
+        .add_pass(
+            SimPass::new(
+                ANIMALS_STEP,
+                "shaders/planet/animals_step.wesl",
+                "animals_step",
+            )
+            .read(ANIMALS)
+            .read(PLANTS)
+            .read(FIRE)
+            .read(BIOME)
+            .write(ANIMALS)
+            .with_params(animals),
+        )
+        .add_pass(
+            SimPass::new(
                 PLANTS_GROW,
                 "shaders/planet/plants_grow.wesl",
                 "plants_grow",
@@ -515,6 +623,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .read(TEMPERATURE)
             .read(MOISTURE)
             .read(BIOME)
+            .read(ANIMALS)
             .write(PLANTS)
             .with_params(plants),
         )
@@ -557,6 +666,8 @@ pub struct PlanetMaterial {
     pub plants: Handle<Image>,
     #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub fire: Handle<Image>,
+    #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -614,6 +725,8 @@ pub struct TerrainMaterial {
     pub plants: Handle<Image>,
     #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub fire: Handle<Image>,
+    #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
 }
 
 impl Material for TerrainMaterial {
@@ -647,6 +760,75 @@ impl Material for TerrainMaterial {
     }
 }
 
+/// Height of the cloud layer above sea level, in metres.
+pub const CLOUD_HEIGHT_M: f32 = 6_000.0;
+
+/// A thin cloud shell around the planet. Coverage is procedural, shaped by latitude bands
+/// and the baked moisture map, and drifts slowly; the same function shades cloud shadows on
+/// the ground (see `shaders/planet/cloud_field.wesl`).
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct CloudMaterial {
+    #[uniform(0)]
+    pub params: CloudParams,
+    #[texture(1, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
+}
+
+#[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
+pub struct CloudParams {
+    pub planet_radius_m: f32,
+    pub cloud_height_m: f32,
+    pub resolution: f32,
+    /// 0 hides the clouds (while generating, before moisture exists).
+    pub visible: f32,
+}
+
+impl Material for CloudMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/planet/clouds.wesl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/planet/clouds.wesl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Seen from above and from below.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// The cloud shell: shown once the planet is live.
+#[derive(Component)]
+struct CloudShell;
+
+fn show_clouds(
+    stats: Res<crate::sim::SimStats>,
+    shells: Query<&MeshMaterial3d<CloudMaterial>, With<CloudShell>>,
+    mut materials: ResMut<Assets<CloudMaterial>>,
+) {
+    let visible = if stats.live() { 1.0 } else { 0.0 };
+    for handle in &shells {
+        if materials
+            .get(&handle.0)
+            .is_some_and(|m| m.params.visible != visible)
+            && let Some(mut m) = materials.get_mut(&handle.0)
+        {
+            m.params.visible = visible;
+        }
+    }
+}
+
 fn spawn_planet(
     mut commands: Commands,
     config: Res<PlanetConfig>,
@@ -655,7 +837,35 @@ fn spawn_planet(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PlanetMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut cloud_materials: ResMut<Assets<CloudMaterial>>,
+    mut vegetation_materials: ResMut<Assets<VegetationMaterial>>,
 ) {
+    let radius = TerrainParams::default().planet_radius_m;
+    let vegetation = vegetation_materials.add(VegetationMaterial {
+        params: VegetationParams::new(radius, graph.resolution as f32),
+        plants: fields.front(PLANTS),
+        temperature: fields.front(TEMPERATURE),
+        moisture: fields.front(MOISTURE),
+    });
+    commands.insert_resource(VegetationMaterialHandle(vegetation));
+    let clouds = cloud_materials.add(CloudMaterial {
+        params: CloudParams {
+            planet_radius_m: radius,
+            cloud_height_m: CLOUD_HEIGHT_M,
+            resolution: graph.resolution as f32,
+            visible: 0.0,
+        },
+        moisture: fields.front(MOISTURE),
+    });
+    commands.spawn((
+        Name::new("Clouds"),
+        Mesh3d(meshes.add(mesh::cube_sphere(192))),
+        MeshMaterial3d(clouds),
+        NotShadowCaster,
+        Transform::from_scale(Vec3::splat(radius + CLOUD_HEIGHT_M)),
+        PlanetAnchor(DVec3::ZERO),
+        CloudShell,
+    ));
     let terrain = terrain_materials.add(TerrainMaterial {
         height: fields.front(HEIGHT),
         water: fields.front(WATER),
@@ -664,6 +874,7 @@ fn spawn_planet(
         biome: fields.front(BIOME),
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
+        moisture: fields.front(MOISTURE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: 1.0,
@@ -681,6 +892,7 @@ fn spawn_planet(
         biome: fields.front(BIOME),
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
+        moisture: fields.front(MOISTURE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,

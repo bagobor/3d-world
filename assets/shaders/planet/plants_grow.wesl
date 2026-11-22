@@ -17,7 +17,8 @@ import super::plant_params::{PlantParams, plantable, capacity};
 @group(0) @binding(4) var temperature: texture_2d_array<f32>;
 @group(0) @binding(5) var moisture: texture_2d_array<f32>;
 @group(0) @binding(6) var biome: texture_2d_array<f32>;
-@group(0) @binding(7) var plants_out: texture_storage_2d_array<rgba32float, write>;
+@group(0) @binding(7) var animals: texture_2d_array<f32>;
+@group(0) @binding(8) var plants_out: texture_storage_2d_array<rgba32float, write>;
 
 fn load_plants(t: vec3<u32>) -> vec4<f32> {
     return textureLoad(plants, vec2<i32>(t.xy), i32(t.z), 0);
@@ -65,6 +66,11 @@ fn plants_grow(@builtin(global_invocation_id) id: vec3<u32>) {
     // Litter: produced by living cover, decomposed faster when wet.
     fuel += params.litter_rate * (c.x + 0.6 * c.y + 0.4 * c.z);
     fuel -= params.decay_rate * (0.3 + precip) * fuel;
+
+    // What the grazers ate this step (`animals_step` ran first and recorded it).
+    let eaten = textureLoad(animals, p, layer, 0).zw;
+    c.x -= eaten.x;
+    c.y -= eaten.y;
 
     // This step's fire.
     let f = textureLoad(fire, p, layer, 0).r;

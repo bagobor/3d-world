@@ -12,6 +12,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|
 | ![orbit](docs/orbit.png) | ![surface](docs/surface.png) |
 
+| over a forest | in a meadow |
+|---|---|
+| ![forest](docs/forest.png) | ![meadow](docs/meadow.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -29,9 +33,20 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 - Step 5: level-of-detail terrain. A quadtree of chunks per cube face streams in detail
   around the camera, from the whole planet down to eye height, with a floating origin.
 
+- Step 6: atmosphere, ocean and clouds. Physically based sky and aerial perspective from the
+  ground to orbit, a shaded ocean with waves and surf, and a drifting cloud layer that casts
+  shadows.
+
+- Step 7: vegetation. Grass, shrubs and trees as real geometry near the camera, placed per
+  biome and grown in by the live ecosystem, so forests spread and burn on screen.
+
+- Step 8: animal populations. Grazers and predators live on the plant ecosystem: they feed,
+  breed, die, migrate towards food and are killed by wildfire; grazing thins the plant
+  cover.
+
 There is no climate simulation and no seasons: the environment maps are static.
 
-Next: atmosphere and ocean, vegetation and animal rendering, animals.
+Next: animal rendering, lighting polish.
 
 ## Running
 
@@ -62,10 +77,12 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves five views, `planet.png` (whole planet),
-`orbit.png` (low orbit) and `surface.png` (40 m above hilly land near the middle of the first
-view), `fly.png` (fly mode, 600 m up) and `walk.png` (walk mode, eye height), each once its
-terrain detail has streamed in, plus `stats.txt` (min/max/mean of every
+Headless mode renders offscreen and saves seven views, `planet.png` (whole planet),
+`orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
+view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
+nearest grassland), `fly.png` (fly mode, 600 m up) and `walk.png` (walk mode, eye height),
+each once its terrain and vegetation have streamed in
+(`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
 driver (Mesa lavapipe), which is what CI uses; generating at 512² takes about 8 minutes there.
@@ -83,13 +100,18 @@ src/planet/       the planet: declares fields + passes, renders from them
   surface.rs      CPU surface: bicubic baked height + procedural detail, in f64
   lod.rs          quadtree LOD terrain chunks
   camera.rs       planet camera (f64) and floating origin
+  sky.rs          atmosphere
+  vegetation.rs   grass, shrub and tree tiles near the camera
 assets/shaders/
   sim/common.wesl         globals, cube-sphere addressing, cross-face neighbours, noise
   planet/terrain_*.wesl   terrain passes
   planet/hydro_*.wesl     hydraulic erosion passes
   planet/moisture_spread.wesl, generation_finalize.wesl   environment maps + biomes
   planet/plants_*.wesl, fire_spread.wesl                  live plant ecosystem
+  planet/animal_params.wesl, animals_*.wesl               live animal populations
   planet/planet_material.wesl   displaces + shades the planet from the height field
+  planet/clouds.wesl, cloud_field.wesl                    cloud shell and cloud shadows
+  planet/vegetation.wesl        grows, sways and shades vegetation
 ```
 
 ## The simulation framework
@@ -176,6 +198,27 @@ fires burn) and `fire` (intensity burning this step). One live step is roughly a
 Constants are in `PlantParams`. The planet material draws bare ground by biome, then grass,
 shrubs and trees by cover, and fires as an emissive glow.
 
+### Animal populations
+
+Field `animals`: r = grazers, g = predators (population density; about 1 is what the best
+pasture feeds), b and a = grass and shrub cover eaten this step. Populations live on
+habitable land (not water or ice), which is also what bounds their migration. Per step
+(`animals_step`, before `plants_grow`):
+
+1. **Feeding**: grazers eat grass and some shrub cover with a saturating (Holling type II)
+   response; predators kill grazers the same way.
+2. **Breeding and death**: grazers grow with what they ate and die off at a base rate plus a
+   crowding term; predators grow with their kills. Together this is Lotka-Volterra with
+   logistic prey, so the two populations cycle and settle.
+3. **Migration**: random wandering (diffusion) plus movement up the gradient of food:
+   grazers towards plant cover and away from crowds, predators towards grazers.
+4. **Fire** kills half the animals in a fully burning texel; a trickle of grazers moves
+   into good empty pasture.
+
+`plants_grow` then takes what was eaten off the plant cover, so heavy grazing keeps
+grasslands short and herds move on. These are populations, not individuals: the renderer
+(next step) will draw individual animals near the camera from these densities.
+
 ### Level-of-detail terrain
 
 While the planet generates, a GPU-displaced sphere previews the live height field. Once it
@@ -195,6 +238,47 @@ is baked, the baked fields are copied to the CPU and the planet is drawn as LOD 
   precision is never a problem, from 20 radii out to 1.8 m above the ground.
 - **Shading**: the same field-driven colours as before; up close, noise breaks the 20 km
   plant cover into groves and clearings, and octaves smaller than a few pixels fade out.
+
+### Atmosphere, ocean and clouds
+
+- **Sky** (`planet/sky.rs`): Bevy's atmosphere (Hillaire 2020), an Earth-like scattering
+  medium 100 km deep, centred on the planet and moved by the floating origin like everything
+  else. Below 30 km it uses lookup textures; above, raymarching, which holds up from orbit.
+  The aerial-perspective range grows with the distance to the horizon. The camera renders in
+  HDR with physical units (100 klx sun, `Exposure::SUNLIGHT`), and the atmosphere also
+  provides the environment light, so shadows are sky-blue and the ocean reflects the sky.
+- **Ocean**: colour by depth (green shallows, deep blue offshore), surf where it is under a
+  few metres deep, and moving wave normals from a few noise octaves. Octaves smaller than a
+  few pixels fade out and turn into roughness, so the sun glint widens with distance.
+- **Clouds**: a shell 6 km up with procedural cover (`cloud_field.wesl`): warped fractal noise
+  shaped by latitude bands (wet equator, clear subtropics, stormy mid-latitudes) and the
+  baked moisture map, drifting slowly. It is not a weather simulation. The terrain shader
+  evaluates the same function where the ray to the sun crosses the cloud layer, which gives
+  cloud shadows.
+
+### Vegetation
+
+`planet/vegetation.rs` draws plants as meshes in tiles of the terrain quadtree, one fixed
+level per layer:
+
+| layer | tile | spacing | drawn to |
+|---|---|---|---|
+| grass (clumps of 5 blades) | ~38 m | 0.45 m | 45 m |
+| shrubs | ~150 m | 4 m | 600 m |
+| trees, detailed (trunk + crown) | ~300 m | 11 m | 700 m |
+| trees, far (one cone or blob) | ~1.2 km | 11 m | 3 km |
+
+- **Placement (CPU)**: a jittered grid that is global to each cube face, so near and far tree
+  tiles put every tree in the same place. Each plant gets a random cover threshold; plants
+  whose biome can never reach that cover, those under water and trees on cliffs are skipped.
+  Conifers win where it is cold. Tiles build on the async task pool like terrain chunks.
+- **Growth (GPU)**: the vertex shader reads the live `plants` field and scales each plant in
+  where its type's cover exceeds its threshold. The drawn density follows the simulation:
+  burnt forest disappears and regrows as the ecosystem recovers. Trees switch from detailed
+  to far meshes at 700 m, and every layer shrinks away towards the end of its range,
+  where the terrain colour (which already shows plant cover) takes over.
+- **Shading**: colour by type, temperature and dryness, darker inside canopies, wind sway that
+  bends tall parts most, PBR lighting and cloud shadows. No shadow maps yet.
 
 ### Hydraulic erosion
 

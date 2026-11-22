@@ -9,12 +9,13 @@
 import bevy_pbr::render::{
     mesh_functions::{get_world_from_local, mesh_position_local_to_world, mesh_normal_local_to_world},
     view_transformations::position_world_to_clip,
-    mesh_view_bindings::view,
+    mesh_view_bindings::{view, globals, lights},
     pbr_types::{PbrInput, pbr_input_new},
     pbr_functions as fns,
 };
 import bevy_core_pipeline::tonemapping::tone_mapping;
 import super::super::sim::common::{dir_to_face, dir_to_face_st, neighbor_texel, gradient_noise};
+import super::cloud_field::cloud_coverage;
 
 struct PlanetMaterialParams {
     planet_radius_m: f32,
@@ -33,6 +34,7 @@ struct PlanetMaterialParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var biome_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(6) var plants_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(7) var fire_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(8) var moisture_tex: texture_2d_array<f32>;
 
 fn load_field(field: u32, t: vec3<u32>) -> f32 {
     let p = vec2<i32>(t.xy);
@@ -42,6 +44,7 @@ fn load_field(field: u32, t: vec3<u32>) -> f32 {
         case 3u: { return textureLoad(temperature_tex, p, i32(t.z), 0).r; }
         case 4u: { return textureLoad(biome_tex, p, i32(t.z), 0).r; }
         case 5u: { return textureLoad(fire_tex, p, i32(t.z), 0).r; }
+        case 6u: { return textureLoad(moisture_tex, p, i32(t.z), 0).r; }
         default: { return textureLoad(height_tex, p, i32(t.z), 0).r; }
     }
 }
@@ -52,6 +55,8 @@ const DISCHARGE: u32 = 2u;
 const TEMPERATURE: u32 = 3u;
 const BIOME: u32 = 4u;
 const FIRE: u32 = 5u;
+const MOISTURE: u32 = 6u;
+const CLOUD_HEIGHT_M: f32 = 6000.0;
 
 fn load_plants(t: vec3<u32>) -> vec4<f32> {
     return textureLoad(plants_tex, vec2<i32>(t.xy), i32(t.z), 0);
@@ -281,6 +286,33 @@ fn terrain_fragment(in: TerrainOutput) -> @location(0) vec4<f32> {
     return shade(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.clip_position, pixel_m);
 }
 
+// Wave normal for the ocean: a few octaves of moving noise, tilting the flat sea surface.
+// Octaves below a few pixels fade out (their effect goes into roughness instead).
+fn ocean_normal(dir: vec3<f32>, flat_n: vec3<f32>, pixel_m: f32) -> vec3<f32> {
+    var t = cross(dir, vec3(0.0, 1.0, 0.0));
+    if dot(t, t) < 1e-6 {
+        t = cross(dir, vec3(1.0, 0.0, 0.0));
+    }
+    t = normalize(t);
+    let b = cross(dir, t);
+    let p = dir * material.planet_radius_m;
+    var slope = vec2(0.0);
+    var wavelength = 120.0;
+    var amp = 0.12;
+    for (var i = 0u; i < 5u; i++) {
+        let fade = smoothstep(2.0 * pixel_m, 8.0 * pixel_m, wavelength);
+        let q = p / wavelength + vec3(globals.time * 0.6, 0.0, globals.time * 0.4) / (1.0 + f32(i));
+        let e = 0.15;
+        let n0 = gradient_noise(q, 500u + i);
+        let nx = gradient_noise(q + t * e, 500u + i);
+        let ny = gradient_noise(q + b * e, 500u + i);
+        slope += amp * fade * vec2(nx - n0, ny - n0) / e;
+        wavelength *= 0.45;
+        amp *= 0.8;
+    }
+    return normalize(flat_n - t * slope.x - b * slope.y);
+}
+
 // Surface colour and lighting for a point at `dir` with height `h` (m above sea level).
 // `slope` is 1 - cos(angle from vertical); `pixel_m` is the footprint of a pixel in metres.
 fn shade(
@@ -293,11 +325,14 @@ fn shade(
     pixel_m: f32,
 ) -> vec4<f32> {
     var pbr: PbrInput = pbr_input_new();
+    var n = world_n;
     var color = terrain_color(h, slope * 8.0, abs(dir.y));
-    if h >= 0.0 && material.show_biomes > 0.5 {
+    var roughness = select(0.85, 0.12, h < 0.0);
+    var reflectance = 0.5;
+    let live = material.show_biomes > 0.5;
+    if h >= 0.0 && live {
         color = biome_color(dir, h, slope * 8.0, pixel_m);
     }
-    var roughness = select(0.85, 0.12, h < 0.0);
     if h >= 0.0 {
         // Rivers and lakes: strong flow or standing water on land. The fields are ~20 km
         // texels, so rivers fade out up close instead of drawing as wide blue bands.
@@ -305,21 +340,42 @@ fn shade(
         let river = river_scale * smoothstep(material.river_discharge * 2.0, material.river_discharge * 6.0, sample_field(DISCHARGE, dir));
         let lake = smoothstep(20.0, 60.0, sample_field(WATER, dir));
         let wet = max(river, lake);
-        color = mix(color, vec3(0.04, 0.16, 0.24), wet);
-        roughness = mix(roughness, 0.1, wet);
+        color = mix(color, vec3(0.02, 0.09, 0.12), wet);
+        roughness = mix(roughness, 0.08, wet);
+    } else if live {
+        // Ocean: clearer and greener in the shallows, deep blue offshore, surf at the coast.
+        let depth = -h;
+        let deep = 1.0 - exp(-depth / 80.0);
+        color = mix(vec3(0.03, 0.22, 0.24), vec3(0.003, 0.025, 0.07), deep);
+        let surf = (1.0 - smoothstep(0.5, 4.0, depth)) * smoothstep(-0.2, 0.4, detail_noise(dir, pixel_m, 300u) + 0.2);
+        color = mix(color, vec3(0.8, 0.85, 0.85), surf * 0.7);
+        n = ocean_normal(dir, n, pixel_m);
+        // Unresolved waves look rougher from afar.
+        roughness = mix(0.04, 0.3, smoothstep(5.0, 3000.0, pixel_m));
+        reflectance = 0.35;
+    }
+    if live {
+        // Cloud shadows: the cloud cover where the ray towards the sun crosses the cloud layer.
+        let sun = lights.directional_lights[0].direction_to_light;
+        let up = max(dot(dir, sun), 0.05);
+        let p = dir * (material.planet_radius_m + max(h, 0.0)) + sun * (CLOUD_HEIGHT_M - max(h, 0.0)) / up;
+        let shadow_dir = normalize(p);
+        let cover = cloud_coverage(shadow_dir, sample_field(MOISTURE, shadow_dir), globals.time);
+        color *= 1.0 - 0.6 * cover;
     }
     pbr.material.base_color = vec4(color, 1.0);
-    if h >= 0.0 && material.show_biomes > 0.5 {
+    if h >= 0.0 && live {
         // Wildfires glow; bright enough to see on the night side.
         let fire = sample_field(FIRE, dir);
-        pbr.material.emissive = vec4(vec3(60000.0, 17000.0, 2400.0) * fire, 1.0);
+        pbr.material.emissive = vec4(vec3(8000.0, 2200.0, 300.0) * fire, 1.0);
     }
+    pbr.material.reflectance = vec3(reflectance);
     pbr.material.perceptual_roughness = roughness;
     pbr.material.metallic = 0.0;
     pbr.frag_coord = clip_position;
     pbr.world_position = world_position;
-    pbr.world_normal = world_n;
-    pbr.N = world_n;
+    pbr.world_normal = n;
+    pbr.N = n;
     pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr.V = fns::calculate_view(world_position, pbr.is_orthographic);
 

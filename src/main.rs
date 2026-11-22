@@ -35,6 +35,7 @@ use planet_sim::{
         self, Biome, CameraControl, PlanetPlugin, camera,
         camera::PlanetCamera,
         lod::{LodSettings, TerrainLod},
+        vegetation::Vegetation,
     },
     sim::{
         self, GpuSimPlugin, SimControl, SimFields, SimStats,
@@ -61,6 +62,8 @@ struct Args {
     view: (f32, f32, f32),
     /// Vertical exaggeration of the LOD terrain.
     exaggeration: f64,
+    /// Headless: capture only these views (all when empty).
+    views: Vec<String>,
 }
 
 impl Args {
@@ -78,6 +81,7 @@ impl Args {
             out: PathBuf::from("out"),
             view: (0.6, 0.35, 3.2),
             exaggeration: 1.0,
+            views: Vec::new(),
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -105,13 +109,15 @@ impl Args {
                 "--pitch" => args.view.1 = value().parse().expect("--pitch"),
                 "--distance" => args.view.2 = value().parse().expect("--distance"),
                 "--exaggeration" => args.exaggeration = value().parse().expect("--exaggeration"),
+                "--views" => args.views = value().split(',').map(str::to_owned).collect(),
                 "-h" | "--help" => {
                     println!(
                         "planet-sim [--headless] [--steps N] [--steps-per-frame N] \
                          [--generation-steps N] [--generation-steps-per-frame N] \
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
-                         [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X]"
+                         [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
+                         [--views planet,orbit,surface,forest,meadow]"
                     );
                     std::process::exit(0);
                 }
@@ -201,16 +207,20 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
         },
         Transform::from_xyz(4.0, 1.5, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // Physical units: full sunlight and a daylight exposure; ambient stands in for skylight.
+    // Physical units: full sunlight and a daylight exposure. Skylight comes from the
+    // atmosphere's environment map; a little ambient keeps the night side from going black.
     commands.insert_resource(GlobalAmbientLight {
-        brightness: 6_000.0,
+        brightness: 300.0,
         ..default()
     });
 
     // The render camera stays at the origin (floating origin, see `planet::camera`).
     let mut camera = commands.spawn((
         Camera3d::default(),
+        bevy::camera::Hdr,
         bevy::camera::Exposure::SUNLIGHT,
+        bevy::pbr::AtmosphereSettings::default(),
+        bevy::light::AtmosphereEnvironmentMapLight::default(),
         Projection::Perspective(PerspectiveProjection {
             near: 0.3,
             far: 1.0e9,
@@ -310,6 +320,7 @@ fn headless_capture(
     cache: Res<SimCache>,
     target: Res<CaptureTarget>,
     lod: Res<TerrainLod>,
+    vegetation: Res<Vegetation>,
     mut camera: ResMut<PlanetCamera>,
     mut control: ResMut<SimControl>,
     mut frames: Local<u64>,
@@ -362,7 +373,10 @@ fn headless_capture(
         }
         let surface = lod.surface().unwrap();
         commands.insert_resource(CaptureDone {
-            shots: shots(&initial_view(&args, camera.radius_m), surface),
+            shots: shots(&initial_view(&args, camera.radius_m), surface, &vegetation)
+                .into_iter()
+                .filter(|(name, _)| args.views.is_empty() || args.views.iter().any(|v| v == name))
+                .collect(),
             ..default()
         });
         return;
@@ -376,8 +390,12 @@ fn headless_capture(
     if done.retake {
         done.retake = false;
         take_screenshot(&mut commands, &target, &args, name);
-    } else if !done.shooting && *wait > 5 && lod.settled() {
-        info!("headless: {name} view, {} chunks", lod.drawn());
+    } else if !done.shooting && *wait > 5 && lod.settled() && vegetation.settled() {
+        info!(
+            "headless: {name} view, {} chunks, {} vegetation tiles",
+            lod.drawn(),
+            vegetation.drawn()
+        );
         done.shooting = true;
         take_screenshot(&mut commands, &target, &args, name);
     }
@@ -399,21 +417,24 @@ fn headless_capture(
 fn shots(
     start: &PlanetCamera,
     surface: &planet::surface::PlanetSurface,
+    vegetation: &Vegetation,
 ) -> Vec<(&'static str, PlanetCamera)> {
     let (north, east, up) = start.frame();
-    let mut target = up;
-    'search: for ring in 0..60 {
-        let radius = ring as f64 * 0.01;
-        for k in 0..(ring * 6).max(1) {
-            let a = k as f64 / (ring * 6).max(1) as f64 * std::f64::consts::TAU;
-            let dir = (up + (north * a.cos() + east * a.sin()) * radius).normalize();
-            let h = surface.height.sample(dir);
-            if (700.0..2500.0).contains(&h) {
-                target = dir;
-                break 'search;
+    // The nearest point to the middle of the view that passes `test`.
+    let find = |test: &dyn Fn(DVec3) -> bool| -> DVec3 {
+        for ring in 0..120 {
+            let radius = ring as f64 * 0.01;
+            for k in 0..(ring * 6).max(1) {
+                let a = k as f64 / (ring * 6).max(1) as f64 * std::f64::consts::TAU;
+                let dir = (up + (north * a.cos() + east * a.sin()) * radius).normalize();
+                if test(dir) {
+                    return dir;
+                }
             }
         }
-    }
+        up
+    };
+    let target = find(&|d| (700.0..2500.0).contains(&surface.height.sample(d)));
     let mut orbit = *start;
     orbit.dir = target;
     orbit.altitude_m = 600_000.0;
@@ -421,12 +442,44 @@ fn shots(
     orbit.heading = 0.5;
     // Stand back from the target so it is in view.
     orbit.move_by(-700_000.0, 0.0);
-
     let mut ground = *start;
     ground.dir = target;
     ground.heading = 0.5;
     ground.pitch = -0.12;
     ground.altitude_m = surface.height(target, 1.0).max(0.0) + 40.0;
+
+    // Low over a forest, and standing in a meadow.
+    // Inland lowland where the test holds for a few km all around.
+    let around = |d: DVec3, test: &dyn Fn(DVec3) -> bool| {
+        let (n, e) = (north - d * north.dot(d), east - d * east.dot(d));
+        (0..8).all(|k| {
+            let a = k as f64 * std::f64::consts::FRAC_PI_4;
+            let p = (d + (n * a.cos() + e * a.sin()) * 0.0008).normalize();
+            (150.0..1200.0).contains(&surface.height(p, 50.0)) && test(p)
+        })
+    };
+    let forest_dir = find(&|d| {
+        around(d, &|p| {
+            vegetation.allowed_cover(p).is_some_and(|c| c[2] > 0.95)
+        })
+    });
+    let mut forest = *start;
+    forest.dir = forest_dir;
+    forest.heading = 1.2;
+    forest.pitch = -0.18;
+    forest.altitude_m = surface.height(forest_dir, 1.0).max(0.0) + 45.0;
+    let meadow_dir = find(&|d| {
+        around(d, &|p| {
+            vegetation
+                .allowed_cover(p)
+                .is_some_and(|c| c[0] > 0.95 && c[2] < 0.6)
+        })
+    });
+    let mut meadow = *start;
+    meadow.dir = meadow_dir;
+    meadow.heading = 2.0;
+    meadow.pitch = -0.1;
+    meadow.altitude_m = surface.height(meadow_dir, 1.0).max(0.0) + 1.7;
     // The other camera modes: flying low over the land, and walking on it.
     let mut fly = *start;
     fly.dir = target;
@@ -442,6 +495,8 @@ fn shots(
         ("planet", *start),
         ("orbit", orbit),
         ("surface", ground),
+        ("forest", forest),
+        ("meadow", meadow),
         ("fly", fly),
         ("walk", walk),
     ]
@@ -469,7 +524,7 @@ fn take_screenshot(commands: &mut Commands, target: &CaptureTarget, args: &Args,
 }
 
 /// Fields summarised at the end of a headless run, with a report name per channel.
-const REPORTED_FIELDS: [(&str, &[&str]); 8] = [
+const REPORTED_FIELDS: [(&str, &[&str]); 9] = [
     (planet::HEIGHT, &[planet::HEIGHT]),
     (planet::WATER, &[planet::WATER]),
     (planet::DISCHARGE, &[planet::DISCHARGE]),
@@ -478,6 +533,10 @@ const REPORTED_FIELDS: [(&str, &[&str]); 8] = [
     (planet::BIOME, &[planet::BIOME]),
     (planet::PLANTS, &["grass", "shrubs", "trees", "fuel"]),
     (planet::FIRE, &[planet::FIRE]),
+    (
+        planet::ANIMALS,
+        &["grazers", "predators", "grass_eaten", "shrub_eaten"],
+    ),
 ];
 
 fn reported_channels() -> usize {
