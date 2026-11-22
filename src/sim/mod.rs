@@ -8,6 +8,15 @@
 //! * **Passes** ([`SimPass`]) are WGSL/WESL compute entry points that read some fields and
 //!   write others. Passes run in declaration order, once per simulation step.
 //!
+//! ## Generate, then live
+//!
+//! A run has two phases. **Generate** runs [`SimPhase::Generate`] passes for
+//! [`SimControl::generation_steps`] steps (as fast as possible, many steps per frame), then
+//! the [`PassTrigger::AfterGeneration`] passes once. **Live** then runs [`SimPhase::Live`]
+//! passes for the rest of the session. Fields marked with [`SimGraph::bake`] are written to
+//! a disk cache when generation finishes ([`cache`]); the next start with the same seed
+//! and resolution loads them and goes straight to live.
+//!
 //! The framework owns everything a pass would otherwise repeat: allocating the textures,
 //! building bind group layouts and bind groups, compiling pipelines, double-buffering any
 //! field that a pass both reads and writes, per-step global uniforms, typed per-pass
@@ -33,6 +42,7 @@
 //! workgroups, so shaders use `@workgroup_size(8, 8, 1)` and `global_invocation_id.z`
 //! is the cube face.
 
+pub mod cache;
 mod render;
 
 use std::sync::{
@@ -60,13 +70,15 @@ pub const CUBE_FACES: u32 = 6;
 /// Workgroup edge used by the default dispatch (`@workgroup_size(8, 8, 1)`).
 pub const WORKGROUP_SIZE: u32 = 8;
 
-/// Upper bound on [`SimControl::steps_per_frame`]; sizes the per-step globals buffer.
-pub const MAX_STEPS_PER_FRAME: u32 = 64;
+/// Upper bound on steps per frame (live or generation); sizes the per-step globals buffer.
+pub const MAX_STEPS_PER_FRAME: u32 = 256;
 
 /// Adds the GPU simulation runtime. Configure it with [`SimGraph`] before `Startup` ends.
 pub struct GpuSimPlugin {
     /// Texels along one edge of each cube face.
     pub resolution: u32,
+    /// Where baked fields are cached, or `None` to always generate and never save.
+    pub cache: Option<cache::CacheConfig>,
 }
 
 impl Plugin for GpuSimPlugin {
@@ -74,6 +86,7 @@ impl Plugin for GpuSimPlugin {
         app.insert_resource(SimGraph::new(self.resolution))
             .init_resource::<SimControl>()
             .init_resource::<SimStats>()
+            .insert_resource(cache::SimCache::new(self.cache.clone()))
             .add_plugins((
                 ExtractResourcePlugin::<SimGraph>::default(),
                 ExtractResourcePlugin::<SimFields>::default(),
@@ -81,7 +94,8 @@ impl Plugin for GpuSimPlugin {
                 ExtractResourcePlugin::<SimStats>::default(),
             ))
             // Fields are allocated after every plugin's Startup systems have declared them.
-            .add_systems(PostStartup, allocate_fields.in_set(SimAllocate));
+            .add_systems(PostStartup, allocate_fields.in_set(SimAllocate))
+            .add_systems(Update, cache::save_baked_fields);
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render::build_render_app(render_app);
@@ -148,15 +162,27 @@ pub struct FieldBinding {
     pub access: FieldAccess,
 }
 
-/// When a pass runs.
+/// Which phase of a run a pass belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimPhase {
+    /// Planet generation: runs for a fixed number of steps, then stops for good.
+    Generate,
+    /// The living simulation after generation (or after loading a cached planet).
+    Live,
+}
+
+/// When a pass runs, within its phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassTrigger {
-    /// Once, at the first step after start-up or after [`SimControl::request_reset`].
+    /// Once, at the first generation step (start-up or [`SimControl::request_reset`]).
     OnReset,
-    /// Every simulation step.
+    /// Every step of the pass's phase.
     EveryStep,
-    /// Every `n`th simulation step (step counter starts at 0 after a reset).
+    /// Every `n`th step of the pass's phase.
     EveryNSteps(u32),
+    /// Once, right after the last generation step: derive final maps from the generated
+    /// state. The pass's phase is ignored.
+    AfterGeneration,
 }
 
 /// One compute pass: a shader entry point plus the fields it touches.
@@ -169,6 +195,7 @@ pub struct SimPass {
     pub entry_point: &'static str,
     pub bindings: Vec<FieldBinding>,
     pub trigger: PassTrigger,
+    pub phase: SimPhase,
     /// Raw bytes of the params uniform (binding 1). Use [`SimPass::with_params`].
     pub params: Vec<u8>,
 }
@@ -181,6 +208,7 @@ impl SimPass {
             entry_point,
             bindings: Vec::new(),
             trigger: PassTrigger::EveryStep,
+            phase: SimPhase::Live,
             params: vec![0; 16],
         }
     }
@@ -203,6 +231,11 @@ impl SimPass {
 
     pub fn trigger(mut self, trigger: PassTrigger) -> Self {
         self.trigger = trigger;
+        self
+    }
+
+    pub fn phase(mut self, phase: SimPhase) -> Self {
+        self.phase = phase;
         self
     }
 
@@ -243,6 +276,8 @@ pub struct SimGraph {
     pub resolution: u32,
     pub fields: Vec<SimFieldDesc>,
     pub passes: Vec<SimPass>,
+    /// Fields saved to the cache after generation and restored from it on load.
+    pub baked: Vec<&'static str>,
 }
 
 impl SimGraph {
@@ -252,6 +287,7 @@ impl SimGraph {
             resolution,
             fields: Vec::new(),
             passes: Vec::new(),
+            baked: Vec::new(),
         }
     }
 
@@ -279,6 +315,19 @@ impl SimGraph {
             );
         }
         self.passes.push(pass);
+        self
+    }
+
+    /// Marks a field as an output of generation: cached to disk and restored on load.
+    /// Fields that only matter while generating (scratch state) stay unbaked.
+    pub fn bake(&mut self, name: &'static str) -> &mut Self {
+        assert!(
+            self.field(name).is_some(),
+            "baked field `{name}` is not declared"
+        );
+        if !self.baked.contains(&name) {
+            self.baked.push(name);
+        }
         self
     }
 
@@ -342,10 +391,16 @@ impl SimFields {
 #[extract_app(RenderApp)]
 pub struct SimControl {
     pub paused: bool,
-    /// Simulation steps dispatched per rendered frame. This is the time-slicing knob: the
+    /// Live steps dispatched per rendered frame. This is the time-slicing knob: the
     /// simulation shares the single wgpu queue with rendering, so its GPU cost lands in
     /// every frame.
     pub steps_per_frame: u32,
+    /// Length of the generation phase, in steps.
+    pub generation_steps: u64,
+    /// Generation steps per rendered frame; generation trades frame rate for speed.
+    pub generation_steps_per_frame: u32,
+    /// Set when baked fields were restored from the cache: the first run skips generation.
+    pub skip_generation: bool,
     /// Seed exposed to shaders as `globals.seed`.
     pub seed: u32,
     /// Simulated time per step, exposed as `globals.dt`.
@@ -358,6 +413,9 @@ impl Default for SimControl {
         Self {
             paused: false,
             steps_per_frame: 1,
+            generation_steps: 0,
+            generation_steps_per_frame: 64,
+            skip_generation: false,
             seed: 1,
             dt: 1.0,
             reset_generation: 0,
@@ -366,9 +424,10 @@ impl Default for SimControl {
 }
 
 impl SimControl {
-    /// Restarts the simulation: `OnReset` passes run again and the step counter returns to 0.
+    /// Regenerates the planet: back to the generate phase, `OnReset` passes run again.
     pub fn request_reset(&mut self) {
         self.reset_generation = self.reset_generation.wrapping_add(1);
+        self.skip_generation = false;
     }
 
     pub fn reset_generation(&self) -> u32 {
@@ -386,6 +445,8 @@ struct SimStatsInner {
     step: AtomicU64,
     total_steps: AtomicU64,
     ready: AtomicU64,
+    generating: AtomicU64,
+    generations_completed: AtomicU64,
 }
 
 impl SimStats {
@@ -404,24 +465,52 @@ impl SimStats {
         self.0.ready.load(Ordering::Relaxed) != 0
     }
 
-    pub(crate) fn publish(&self, step: u64, total: u64, ready: bool) {
+    /// True while the generate phase is running.
+    pub fn generating(&self) -> bool {
+        self.0.generating.load(Ordering::Relaxed) != 0
+    }
+
+    /// Generation runs finished since start-up (a cache load does not count).
+    pub fn generations_completed(&self) -> u64 {
+        self.0.generations_completed.load(Ordering::Relaxed)
+    }
+
+    /// True once the planet exists: generated, or loaded from the cache.
+    pub fn live(&self) -> bool {
+        self.ready() && !self.generating()
+    }
+
+    pub(crate) fn publish(&self, step: u64, total: u64, ready: bool, generating: bool, gens: u64) {
         self.0.step.store(step, Ordering::Relaxed);
         self.0.total_steps.store(total, Ordering::Relaxed);
         self.0.ready.store(ready as u64, Ordering::Relaxed);
+        self.0
+            .generating
+            .store(generating as u64, Ordering::Relaxed);
+        self.0.generations_completed.store(gens, Ordering::Relaxed);
     }
 }
 
 fn allocate_fields(
     mut commands: Commands,
     graph: Res<SimGraph>,
+    mut control: ResMut<SimControl>,
+    mut cache: ResMut<cache::SimCache>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let res = graph.resolution;
+    // Restore a previously generated planet if the cache has one for this seed.
+    let mut restored = cache.load(&graph, control.seed);
+    if restored.is_some() {
+        control.skip_generation = true;
+    }
     let mut fields = HashMap::default();
     for desc in &graph.fields {
-        let mut make = || images.add(new_field_image(res, desc.format));
-        let front = make();
-        let back = graph.needs_back_buffer(desc.name).then(make);
+        let data = restored.as_mut().and_then(|r| r.remove(desc.name));
+        let front = images.add(new_field_image(res, desc.format, data));
+        let back = graph
+            .needs_back_buffer(desc.name)
+            .then(|| images.add(new_field_image(res, desc.format, None)));
         fields.insert(
             desc.name,
             SimField {
@@ -442,7 +531,8 @@ fn allocate_fields(
     commands.insert_resource(SimFields(fields));
 }
 
-fn new_field_image(resolution: u32, format: FieldFormat) -> Image {
+/// A field texture; `data`, if given, is tightly packed texels for all 6 layers.
+fn new_field_image(resolution: u32, format: FieldFormat, data: Option<Vec<u8>>) -> Image {
     let mut image = Image::new_uninit(
         Extent3d {
             width: resolution,
@@ -453,6 +543,7 @@ fn new_field_image(resolution: u32, format: FieldFormat) -> Image {
         format.texture_format(),
         RenderAssetUsages::RENDER_WORLD,
     );
+    image.data = data;
     image.texture_descriptor.usage = TextureUsages::STORAGE_BINDING
         | TextureUsages::TEXTURE_BINDING
         | TextureUsages::COPY_SRC

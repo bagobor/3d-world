@@ -6,7 +6,7 @@ use bevy::{
     light::NotShadowCaster, prelude::*, render::render_resource::AsBindGroup, shader::ShaderRef,
 };
 
-use crate::sim::{FieldFormat, PassTrigger, SimAllocate, SimFields, SimGraph, SimPass};
+use crate::sim::{FieldFormat, PassTrigger, SimAllocate, SimFields, SimGraph, SimPass, SimPhase};
 
 /// Terrain height in metres above the sea-level datum.
 pub const HEIGHT: &str = "height";
@@ -18,6 +18,64 @@ pub const SEDIMENT: &str = "sediment";
 pub const FLUX: &str = "flux";
 /// Smoothed inflow per step: high along rivers.
 pub const DISCHARGE: &str = "discharge";
+/// 0..1, carried inland from oceans, lakes and rivers.
+pub const MOISTURE: &str = "moisture";
+/// Mean annual temperature, °C (static: there is no climate simulation).
+pub const TEMPERATURE: &str = "temperature";
+/// Biome class index ([`Biome`]), stored as f32.
+pub const BIOME: &str = "biome";
+
+/// Bump when generation changes, so cached planets from older generators are not loaded.
+pub const GENERATOR_VERSION: &str = "planet-v1";
+
+/// Biome classes in the `biome` field. Keep in sync with `shaders/planet/env_params.wesl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Biome {
+    Ocean = 0,
+    Lake,
+    Ice,
+    Tundra,
+    Desert,
+    BorealForest,
+    Grassland,
+    TemperateForest,
+    Shrubland,
+    TropicalForest,
+    Savanna,
+}
+
+impl Biome {
+    pub const ALL: [Biome; 11] = [
+        Biome::Ocean,
+        Biome::Lake,
+        Biome::Ice,
+        Biome::Tundra,
+        Biome::Desert,
+        Biome::BorealForest,
+        Biome::Grassland,
+        Biome::TemperateForest,
+        Biome::Shrubland,
+        Biome::TropicalForest,
+        Biome::Savanna,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Biome::Ocean => "ocean",
+            Biome::Lake => "lake",
+            Biome::Ice => "ice",
+            Biome::Tundra => "tundra",
+            Biome::Desert => "desert",
+            Biome::BorealForest => "boreal forest",
+            Biome::Grassland => "grassland",
+            Biome::TemperateForest => "temperate forest",
+            Biome::Shrubland => "shrubland",
+            Biome::TropicalForest => "tropical forest",
+            Biome::Savanna => "savanna",
+        }
+    }
+}
 
 const TERRAIN_INIT: &str = "terrain_init";
 const TERRAIN_RELAX: &str = "terrain_relax";
@@ -25,6 +83,8 @@ const HYDRO_INIT: &str = "hydro_init";
 const HYDRO_FLUX: &str = "hydro_flux";
 const HYDRO_WATER: &str = "hydro_water";
 const HYDRO_ERODE: &str = "hydro_erode";
+const MOISTURE_SPREAD: &str = "moisture_spread";
+const GENERATION_FINALIZE: &str = "generation_finalize";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
 #[repr(C)]
@@ -94,6 +154,39 @@ impl Default for HydroParams {
     }
 }
 
+/// Mirrors `EnvParams` in `shaders/planet/env_params.wesl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EnvParams {
+    pub planet_radius_m: f32,
+    pub moisture_length_m: f32,
+    pub barrier_height_m: f32,
+    pub lake_depth_m: f32,
+    pub river_discharge: f32,
+    pub equator_temp_c: f32,
+    pub pole_temp_c: f32,
+    pub lapse_rate_c_per_m: f32,
+    pub subtropic_dryness: f32,
+    pub _pad: [f32; 3],
+}
+
+impl Default for EnvParams {
+    fn default() -> Self {
+        Self {
+            planet_radius_m: TerrainParams::default().planet_radius_m,
+            moisture_length_m: 900_000.0,
+            barrier_height_m: 1_500.0,
+            lake_depth_m: 20.0,
+            river_discharge: 0.1,
+            equator_temp_c: 28.0,
+            pole_temp_c: -30.0,
+            lapse_rate_c_per_m: 0.0065,
+            subtropic_dryness: 0.6,
+            _pad: [0.0; 3],
+        }
+    }
+}
+
 pub struct PlanetPlugin {
     /// Vertices along one cube-face edge of the render mesh.
     pub mesh_subdivisions: u32,
@@ -123,22 +216,30 @@ impl Plugin for PlanetPlugin {
                 height_exaggeration: self.height_exaggeration,
             })
             .add_systems(Startup, declare_simulation)
-            .add_systems(PostStartup, spawn_planet.after(SimAllocate));
+            .add_systems(PostStartup, spawn_planet.after(SimAllocate))
+            .add_systems(Update, toggle_biome_view);
     }
 }
 
-/// The whole planet simulation. Passes run in this order every step. New subsystems
-/// (climate, vegetation, ...) add their fields and passes here.
+/// The planet. Generation (run once, then cached) builds terrain, erodes it with water,
+/// spreads moisture inland and finally derives static temperature and biome maps. Live
+/// passes (ecosystem, ...) will be added with `SimPhase::Live`.
 fn declare_simulation(mut graph: ResMut<SimGraph>) {
-    let params = TerrainParams::default();
+    let terrain = TerrainParams::default();
     let hydro = HydroParams::default();
+    let env = EnvParams::default();
+    let generate = |pass: SimPass| pass.phase(SimPhase::Generate);
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
         .add_field(WATER, FieldFormat::R32Float)
         .add_field(SEDIMENT, FieldFormat::R32Float)
         .add_field(FLUX, FieldFormat::Rgba32Float)
         .add_field(DISCHARGE, FieldFormat::R32Float)
-        .add_pass(
+        .add_field(MOISTURE, FieldFormat::R32Float)
+        .add_field(TEMPERATURE, FieldFormat::R32Float)
+        .add_field(BIOME, FieldFormat::R32Float)
+        // Initial state.
+        .add_pass(generate(
             SimPass::new(
                 TERRAIN_INIT,
                 "shaders/planet/terrain_init.wesl",
@@ -146,9 +247,21 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             )
             .write(HEIGHT)
             .trigger(PassTrigger::OnReset)
-            .with_params(params),
-        )
-        .add_pass(
+            .with_params(terrain),
+        ))
+        .add_pass(generate(
+            SimPass::new(HYDRO_INIT, "shaders/planet/hydro_init.wesl", "hydro_init")
+                .read(HEIGHT)
+                .write(WATER)
+                .write(SEDIMENT)
+                .write(FLUX)
+                .write(DISCHARGE)
+                .write(MOISTURE)
+                .trigger(PassTrigger::OnReset)
+                .with_params(hydro),
+        ))
+        // Every generation step: thermal erosion, moisture, then pipe-model hydraulics.
+        .add_pass(generate(
             SimPass::new(
                 TERRAIN_RELAX,
                 "shaders/planet/terrain_relax.wesl",
@@ -156,28 +269,30 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             )
             .read(HEIGHT)
             .write(HEIGHT)
-            .with_params(params),
-        )
-        // Hydraulic erosion: pipe-model water flow carrying sediment.
-        .add_pass(
-            SimPass::new(HYDRO_INIT, "shaders/planet/hydro_init.wesl", "hydro_init")
-                .read(HEIGHT)
-                .write(WATER)
-                .write(SEDIMENT)
-                .write(FLUX)
-                .write(DISCHARGE)
-                .trigger(PassTrigger::OnReset)
-                .with_params(hydro),
-        )
-        .add_pass(
+            .with_params(terrain),
+        ))
+        .add_pass(generate(
+            SimPass::new(
+                MOISTURE_SPREAD,
+                "shaders/planet/moisture_spread.wesl",
+                "moisture_spread",
+            )
+            .read(HEIGHT)
+            .read(WATER)
+            .read(DISCHARGE)
+            .read(MOISTURE)
+            .write(MOISTURE)
+            .with_params(env),
+        ))
+        .add_pass(generate(
             SimPass::new(HYDRO_FLUX, "shaders/planet/hydro_flux.wesl", "hydro_flux")
                 .read(HEIGHT)
                 .read(WATER)
                 .read(FLUX)
                 .write(FLUX)
                 .with_params(hydro),
-        )
-        .add_pass(
+        ))
+        .add_pass(generate(
             SimPass::new(
                 HYDRO_WATER,
                 "shaders/planet/hydro_water.wesl",
@@ -191,9 +306,10 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .write(WATER)
             .write(SEDIMENT)
             .write(DISCHARGE)
+            .read(MOISTURE)
             .with_params(hydro),
-        )
-        .add_pass(
+        ))
+        .add_pass(generate(
             SimPass::new(
                 HYDRO_ERODE,
                 "shaders/planet/hydro_erode.wesl",
@@ -205,7 +321,28 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .write(HEIGHT)
             .write(SEDIMENT)
             .with_params(hydro),
+        ))
+        // Once at the end: settle sediment, derive temperature and biomes.
+        .add_pass(
+            SimPass::new(
+                GENERATION_FINALIZE,
+                "shaders/planet/generation_finalize.wesl",
+                "generation_finalize",
+            )
+            .read(HEIGHT)
+            .read(SEDIMENT)
+            .read(WATER)
+            .read(MOISTURE)
+            .write(HEIGHT)
+            .write(TEMPERATURE)
+            .write(BIOME)
+            .trigger(PassTrigger::AfterGeneration)
+            .with_params(env),
         );
+    // What a generated planet is: everything the renderer and live simulation read.
+    for field in [HEIGHT, WATER, DISCHARGE, MOISTURE, TEMPERATURE, BIOME] {
+        graph.bake(field);
+    }
 }
 
 /// Draws the planet directly from the simulation's fields.
@@ -219,6 +356,10 @@ pub struct PlanetMaterial {
     pub water: Handle<Image>,
     #[texture(3, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub discharge: Handle<Image>,
+    #[texture(4, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub temperature: Handle<Image>,
+    #[texture(5, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub biome: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -228,6 +369,8 @@ pub struct PlanetMaterialParams {
     pub resolution: f32,
     /// Discharge (m of water per step) above which land is drawn as river.
     pub river_discharge: f32,
+    /// 1 once the static maps exist (after generation or a cache load).
+    pub show_biomes: f32,
 }
 
 impl Material for PlanetMaterial {
@@ -252,11 +395,14 @@ fn spawn_planet(
         height: fields.front(HEIGHT),
         water: fields.front(WATER),
         discharge: fields.front(DISCHARGE),
+        temperature: fields.front(TEMPERATURE),
+        biome: fields.front(BIOME),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,
             resolution: graph.resolution as f32,
             river_discharge: 0.1,
+            show_biomes: 0.0,
         },
     });
     commands.spawn((
@@ -267,4 +413,22 @@ fn spawn_planet(
         NotShadowCaster,
         Transform::default(),
     ));
+}
+
+/// Biome colours only exist once generation has finished (or the planet was loaded).
+fn toggle_biome_view(
+    stats: Res<crate::sim::SimStats>,
+    planets: Query<&MeshMaterial3d<PlanetMaterial>>,
+    mut materials: ResMut<Assets<PlanetMaterial>>,
+) {
+    let show = if stats.live() { 1.0 } else { 0.0 };
+    for handle in &planets {
+        if materials
+            .get(&handle.0)
+            .is_some_and(|m| m.params.show_biomes != show)
+            && let Some(mut material) = materials.get_mut(&handle.0)
+        {
+            material.params.show_biomes = show;
+        }
+    }
 }

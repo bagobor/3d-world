@@ -16,6 +16,7 @@ import super::hydro_params::HydroParams;
 @group(0) @binding(7) var water_out: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(8) var sediment_out: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(9) var discharge_out: texture_storage_2d_array<r32float, write>;
+@group(0) @binding(10) var moisture: texture_2d_array<f32>;
 
 fn load(tex: texture_2d_array<f32>, t: vec3<u32>) -> f32 {
     return textureLoad(tex, vec2<i32>(t.xy), i32(t.z), 0).r;
@@ -57,7 +58,9 @@ fn hydro_water(@builtin(global_invocation_id) id: vec3<u32>) {
         // Ocean: the sea surface stays at the datum (an infinite reservoir and sink).
         w_new = -h;
     } else {
-        w_new = (w_new + params.rain_m) * (1.0 - params.evaporation);
+        // Wet regions get more rain, so deserts erode less than rainforests.
+        let rain = params.rain_m * (0.2 + 1.6 * load(moisture, id));
+        w_new = (w_new + rain) * (1.0 - params.evaporation);
     }
 
     let q = mix(load(discharge, id), inflow, params.discharge_smoothing);

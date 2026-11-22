@@ -2,11 +2,14 @@
 //!
 //! ```text
 //! cargo run --release                         # interactive window
-//! cargo run --release -- --headless --steps 300 --out out
+//! cargo run --release -- --headless --out out  # generate (or load) a planet, save a picture
 //! ```
 //!
-//! Interactive controls: drag to orbit, scroll to zoom, Space pause, R regenerate with a new
-//! seed, Up/Down change simulation steps per frame.
+//! The first start with a seed and resolution generates the planet (terrain, erosion,
+//! moisture, temperature, biomes) and saves it under `cache/`; later starts load it.
+//!
+//! Interactive controls: drag to orbit, scroll to zoom, Space pause, R generate a new planet
+//! with the next seed, Up/Down change simulation steps per frame.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -25,16 +28,26 @@ use bevy::{
 };
 
 use planet_sim::{
+    planet::Biome,
     planet::{self, PlanetPlugin},
-    sim::{self, GpuSimPlugin, SimControl, SimFields, SimStats},
+    sim::{
+        self, GpuSimPlugin, SimControl, SimFields, SimStats,
+        cache::{CacheConfig, SimCache},
+    },
 };
 
 #[derive(Resource, Clone, Debug)]
 struct Args {
     headless: bool,
-    /// Headless: simulation steps to run before capturing.
+    /// Headless: live simulation steps to run after generation, before capturing.
     steps: u64,
     steps_per_frame: u32,
+    generation_steps: u64,
+    generation_steps_per_frame: u32,
+    /// Planet cache directory; `None` disables the cache.
+    cache: Option<PathBuf>,
+    /// Ignore a cached planet and generate it again.
+    regenerate: bool,
     resolution: u32,
     seed: u32,
     out: PathBuf,
@@ -46,8 +59,12 @@ impl Args {
     fn parse() -> Self {
         let mut args = Args {
             headless: false,
-            steps: 200,
+            steps: 0,
             steps_per_frame: 4,
+            generation_steps: 3000,
+            generation_steps_per_frame: 64,
+            cache: Some(PathBuf::from("cache")),
+            regenerate: false,
             resolution: 512,
             seed: 7,
             out: PathBuf::from("out"),
@@ -62,6 +79,16 @@ impl Args {
                 "--steps-per-frame" => {
                     args.steps_per_frame = value().parse().expect("--steps-per-frame")
                 }
+                "--generation-steps" => {
+                    args.generation_steps = value().parse().expect("--generation-steps")
+                }
+                "--generation-steps-per-frame" => {
+                    args.generation_steps_per_frame =
+                        value().parse().expect("--generation-steps-per-frame")
+                }
+                "--cache" => args.cache = Some(value().into()),
+                "--no-cache" => args.cache = None,
+                "--regenerate" => args.regenerate = true,
                 "--resolution" => args.resolution = value().parse().expect("--resolution"),
                 "--seed" => args.seed = value().parse().expect("--seed"),
                 "--out" => args.out = value().into(),
@@ -71,6 +98,8 @@ impl Args {
                 "-h" | "--help" => {
                     println!(
                         "planet-sim [--headless] [--steps N] [--steps-per-frame N] \
+                         [--generation-steps N] [--generation-steps-per-frame N] \
+                         [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII]"
                     );
@@ -115,12 +144,19 @@ fn main() -> AppExit {
     app.add_plugins((
         GpuSimPlugin {
             resolution: args.resolution,
+            cache: args.cache.clone().map(|dir| CacheConfig {
+                dir,
+                tag: planet::GENERATOR_VERSION.into(),
+                reuse: !args.regenerate,
+            }),
         },
         PlanetPlugin::default(),
     ))
     .insert_resource({
         let mut control = SimControl::default();
         control.steps_per_frame = args.steps_per_frame;
+        control.generation_steps = args.generation_steps;
+        control.generation_steps_per_frame = args.generation_steps_per_frame;
         control.seed = args.seed;
         control
     })
@@ -217,37 +253,54 @@ fn window_title(
     time: Res<Time>,
     mut window: Single<&mut Window>,
 ) {
-    window.title = format!(
-        "planet-sim | seed {} | step {} | {} steps/frame{} | {:.0} fps",
-        control.seed,
-        stats.step(),
-        control.steps_per_frame,
-        if control.paused { " (paused)" } else { "" },
-        1.0 / time.delta_secs().max(1e-6),
-    );
+    let fps = 1.0 / time.delta_secs().max(1e-6);
+    window.title = if stats.generating() {
+        format!(
+            "planet-sim | seed {} | generating {}/{} | {fps:.0} fps",
+            control.seed,
+            stats.step(),
+            control.generation_steps,
+        )
+    } else {
+        format!(
+            "planet-sim | seed {} | step {} | {} steps/frame{} | {fps:.0} fps",
+            control.seed,
+            stats.step(),
+            control.steps_per_frame,
+            if control.paused { " (paused)" } else { "" },
+        )
+    };
 }
 
-/// Headless run: wait for `--steps` simulation steps, then save a screenshot and the
-/// field statistics (`stats.txt`), then exit.
+/// Headless run: wait for generation (or the cache load), the cache write and `--steps` live
+/// steps, then save a screenshot and the field statistics (`stats.txt`), then exit.
 fn headless_capture(
     mut commands: Commands,
     args: Res<Args>,
     stats: Res<SimStats>,
     fields: Option<Res<SimFields>>,
+    cache: Res<SimCache>,
     target: Res<CaptureTarget>,
     mut control: ResMut<SimControl>,
     mut state: Local<(bool, u32)>,
     mut frames: Local<u64>,
+    done: Option<ResMut<CaptureDone>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frames += 1;
     let (requested, _) = *state;
     if !requested {
         if frames.is_multiple_of(60) {
-            info!("headless: frame {}, step {}", *frames, stats.step());
+            let phase = if stats.generating() {
+                "generating"
+            } else {
+                "live"
+            };
+            info!("headless: frame {}, {phase} step {}", *frames, stats.step());
         }
-        if !stats.ready() || stats.step() < args.steps {
-            if *frames > 20_000 {
+        let saved = !cache.enabled() || cache.saved_generations() >= stats.generations_completed();
+        if !stats.live() || !saved || stats.step() < args.steps {
+            if *frames > 200_000 {
                 error!("headless: simulation never became ready");
                 exit.write(AppExit::error());
             }
@@ -257,15 +310,9 @@ fn headless_capture(
         // Freeze the simulation so the screenshot and readback show the same state.
         control.paused = true;
         std::fs::create_dir_all(&args.out).expect("create output dir");
-        info!("headless: capturing at step {}", stats.step());
+        info!("headless: capturing at live step {}", stats.step());
 
-        let shot = args.out.join("planet.png");
-        commands
-            .spawn(Screenshot::image(target.0.clone()))
-            .observe(save_to_disk(shot))
-            .observe(|_: On<ScreenshotCaptured>, mut done: ResMut<CaptureDone>| {
-                done.screenshot = true;
-            });
+        take_screenshot(&mut commands, &target, &args);
 
         let resolution = args.resolution;
         for name in REPORTED_FIELDS {
@@ -283,24 +330,55 @@ fn headless_capture(
         return;
     }
     state.1 += 1;
-    // Give the async copies a few frames; then exit.
-    if state.1 > 600 {
+    if let Some(mut done) = done
+        && done.retake
+    {
+        done.retake = false;
+        take_screenshot(&mut commands, &target, &args);
+    }
+    // Give the async copies and pipeline compilation time; then give up.
+    if state.1 > 3000 {
         error!("headless: capture timed out");
         exit.write(AppExit::error());
     }
 }
 
+/// Saves `planet.png` once the planet is on screen. A loaded planet is ready before its
+/// render pipelines finish compiling, so blank frames are retaken.
+fn take_screenshot(commands: &mut Commands, target: &CaptureTarget, args: &Args) {
+    let mut save = save_to_disk(args.out.join("planet.png"));
+    commands.spawn(Screenshot::image(target.0.clone())).observe(
+        move |shot: On<ScreenshotCaptured>, mut done: ResMut<CaptureDone>| {
+            let drawn = shot
+                .image
+                .data
+                .as_ref()
+                .is_some_and(|px| px.chunks(4).any(|p| p[..3].iter().any(|&c| c > 8)));
+            if drawn {
+                done.screenshot = true;
+                save(shot);
+            } else {
+                done.retake = true;
+            }
+        },
+    );
+}
+
 /// R32Float fields summarised at the end of a headless run.
-const REPORTED_FIELDS: [&str; 4] = [
+const REPORTED_FIELDS: [&str; 6] = [
     planet::HEIGHT,
     planet::WATER,
-    planet::SEDIMENT,
     planet::DISCHARGE,
+    planet::MOISTURE,
+    planet::TEMPERATURE,
+    planet::BIOME,
 ];
 
 #[derive(Resource, Default)]
 struct CaptureDone {
     screenshot: bool,
+    /// The last screenshot was blank (planet pipelines still compiling): take another.
+    retake: bool,
     fields: Vec<(&'static str, FieldStats)>,
 }
 
@@ -315,8 +393,14 @@ fn exit_when_captured(
         return;
     }
     let get = |name: &str| done.fields.iter().find(|(n, _)| *n == name).map(|(_, s)| s);
+    let origin = if stats.generations_completed() == 0 {
+        "loaded from cache".to_string()
+    } else {
+        format!("generated in {} steps", args.generation_steps)
+    };
     let mut report = format!(
-        "step {}, {r}x{r}x6 texels\n",
+        "planet seed {}, {r}x{r}x6 texels, {origin}; live step {}\n",
+        args.seed,
         stats.step(),
         r = args.resolution
     );
@@ -331,12 +415,19 @@ fn exit_when_captured(
             s.non_finite
         );
     }
-    // Erosion only moves material between terrain and suspended sediment.
-    let rock = get(planet::HEIGHT).unwrap().sum + get(planet::SEDIMENT).unwrap().sum;
-    report += &format!(
-        "terrain + sediment mean: {:.4} m\n",
-        rock / get(planet::HEIGHT).unwrap().count.max(1) as f64
-    );
+    let biomes = &get(planet::BIOME).unwrap().histogram;
+    let total: u64 = biomes.iter().sum();
+    report += "biomes:";
+    for biome in Biome::ALL {
+        let n = biomes[biome as usize];
+        report += &format!(
+            " {} {:.1}%,",
+            biome.name(),
+            100.0 * n as f64 / total.max(1) as f64
+        );
+    }
+    report.pop();
+    report.push('\n');
     for line in report.lines() {
         info!("headless: {line}");
     }
@@ -358,6 +449,8 @@ struct FieldStats {
     count: u64,
     positive: u64,
     non_finite: u64,
+    /// Texels per rounded value 0..16 (biome classes).
+    histogram: [u64; 16],
 }
 
 impl FieldStats {
@@ -386,6 +479,9 @@ impl FieldStats {
                     s.max = s.max.max(x);
                     s.sum += x as f64;
                     s.positive += (x > 0.0) as u64;
+                    if (0.0..16.0).contains(&x.round()) {
+                        s.histogram[x.round() as usize] += 1;
+                    }
                     s.count += 1;
                 }
             }

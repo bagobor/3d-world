@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Headless run output
 /out
+
+# Generated planets
+/cache

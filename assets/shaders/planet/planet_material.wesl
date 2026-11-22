@@ -17,18 +17,24 @@ struct PlanetMaterialParams {
     height_exaggeration: f32,
     resolution: f32,
     river_discharge: f32,
+    // 1 once the static maps exist (after generation or a cache load).
+    show_biomes: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var height_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var<uniform> material: PlanetMaterialParams;
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var water_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var discharge_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var temperature_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var biome_tex: texture_2d_array<f32>;
 
 fn load_field(field: u32, t: vec3<u32>) -> f32 {
     let p = vec2<i32>(t.xy);
     switch field {
         case 1u: { return textureLoad(water_tex, p, i32(t.z), 0).r; }
         case 2u: { return textureLoad(discharge_tex, p, i32(t.z), 0).r; }
+        case 3u: { return textureLoad(temperature_tex, p, i32(t.z), 0).r; }
+        case 4u: { return textureLoad(biome_tex, p, i32(t.z), 0).r; }
         default: { return textureLoad(height_tex, p, i32(t.z), 0).r; }
     }
 }
@@ -36,6 +42,43 @@ fn load_field(field: u32, t: vec3<u32>) -> f32 {
 const HEIGHT: u32 = 0u;
 const WATER: u32 = 1u;
 const DISCHARGE: u32 = 2u;
+const TEMPERATURE: u32 = 3u;
+const BIOME: u32 = 4u;
+
+// Ground albedo per biome class (see `env_params.wesl`).
+fn biome_albedo(biome: f32) -> vec3<f32> {
+    switch u32(biome + 0.5) {
+        case 0u: { return vec3(0.02, 0.08, 0.15); }  // ocean (not used on land)
+        case 1u: { return vec3(0.04, 0.16, 0.24); }  // lake
+        case 2u: { return vec3(0.90, 0.92, 0.96); }  // ice
+        case 3u: { return vec3(0.42, 0.42, 0.33); }  // tundra
+        case 4u: { return vec3(0.80, 0.68, 0.46); }  // desert
+        case 5u: { return vec3(0.10, 0.22, 0.12); }  // boreal forest
+        case 6u: { return vec3(0.45, 0.52, 0.24); }  // grassland
+        case 7u: { return vec3(0.15, 0.32, 0.10); }  // temperate forest
+        case 8u: { return vec3(0.50, 0.47, 0.30); }  // shrubland
+        case 9u: { return vec3(0.06, 0.25, 0.05); }  // tropical forest
+        default: { return vec3(0.60, 0.55, 0.28); }  // savanna
+    }
+}
+
+// Biome colour, blended bilinearly between the 4 nearest texels' classes.
+fn sample_biome_albedo(dir: vec3<f32>) -> vec3<f32> {
+    let res = u32(material.resolution);
+    let face = dir_to_face(dir);
+    let st = dir_to_face_st(face, dir);
+    let c = (st * 0.5 + 0.5) * material.resolution - 0.5;
+    let base = floor(c);
+    let f = c - base;
+    let b = vec2<i32>(base);
+    let origin = vec3<u32>(vec2<u32>(clamp(b, vec2(0), vec2(i32(res) - 1))), face);
+    let d = b - vec2<i32>(origin.xy);
+    let c00 = biome_albedo(load_field(BIOME, neighbor_texel(origin, d, res)));
+    let c10 = biome_albedo(load_field(BIOME, neighbor_texel(origin, d + vec2(1, 0), res)));
+    let c01 = biome_albedo(load_field(BIOME, neighbor_texel(origin, d + vec2(0, 1), res)));
+    let c11 = biome_albedo(load_field(BIOME, neighbor_texel(origin, d + vec2(1, 1), res)));
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
 
 fn sample_height(dir: vec3<f32>) -> f32 {
     return sample_field(HEIGHT, dir);
@@ -91,6 +134,17 @@ fn vertex(in: Vertex) -> VertexOutput {
     return out;
 }
 
+// Land colour from the baked biome and temperature maps.
+fn biome_color(dir: vec3<f32>, h: f32, slope: f32) -> vec3<f32> {
+    var c = sample_biome_albedo(dir);
+    // Beaches, bare rock on steep slopes, snow where it is cold enough.
+    c = mix(vec3(0.76, 0.70, 0.50), c, smoothstep(2.0, 30.0, h));
+    c = mix(c, vec3(0.35, 0.30, 0.27), smoothstep(0.35, 0.6, slope));
+    let snow = smoothstep(-3.0, -9.0, sample_field(TEMPERATURE, dir)) * (1.0 - smoothstep(0.5, 0.8, slope));
+    return mix(c, vec3(0.92, 0.94, 0.97), snow);
+}
+
+// Placeholder colours while the planet is still generating (no biome maps yet).
 fn terrain_color(h: f32, slope: f32, lat: f32) -> vec3<f32> {
     if h < 0.0 {
         let depth = clamp(-h / 5000.0, 0.0, 1.0);
@@ -128,6 +182,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var pbr: PbrInput = pbr_input_new();
     var color = terrain_color(h, slope * 8.0, abs(dir.y));
+    if h >= 0.0 && material.show_biomes > 0.5 {
+        color = biome_color(dir, h, slope * 8.0);
+    }
     var roughness = select(0.85, 0.12, h < 0.0);
     if h >= 0.0 {
         // Rivers and lakes: strong flow or standing water on land.

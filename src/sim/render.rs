@@ -19,7 +19,7 @@ use bevy::{
 
 use super::{
     CUBE_FACES, FieldAccess, MAX_STEPS_PER_FRAME, PassTrigger, SimControl, SimFields, SimGraph,
-    SimStats, WORKGROUP_SIZE,
+    SimPhase, SimStats, WORKGROUP_SIZE,
 };
 
 /// Size of one per-step globals slot. 256 is the largest
@@ -75,17 +75,45 @@ struct SimGpu {
     _shaders: Vec<Handle<Shader>>,
 }
 
-/// Simulation clock and this frame's plan, owned by the render world.
-#[derive(Resource, Default)]
+/// One step to dispatch this frame.
+struct Planned {
+    /// Globals slot (dynamic offset index) holding this step's globals.
+    slot: u32,
+    /// Step index within its phase.
+    step: u64,
+    phase: SimPhase,
+    /// Last generation step: run the `AfterGeneration` passes after it.
+    finish_generation: bool,
+}
+
+/// Simulation clock, phase and this frame's plan, owned by the render world.
+#[derive(Resource)]
 struct SimRuntime {
     ready: bool,
     failed: bool,
     reset_generation: Option<u32>,
+    phase: SimPhase,
     step: u64,
     total_steps: u64,
     time: f32,
-    /// Steps to dispatch this frame: (globals slot, step index since reset).
-    plan: Vec<(u32, u64)>,
+    generations_completed: u64,
+    plan: Vec<Planned>,
+}
+
+impl Default for SimRuntime {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            failed: false,
+            reset_generation: None,
+            phase: SimPhase::Generate,
+            step: 0,
+            total_steps: 0,
+            time: 0.0,
+            generations_completed: 0,
+            plan: Vec::new(),
+        }
+    }
 }
 
 fn prepare_sim(
@@ -162,32 +190,73 @@ fn prepare_sim(
         queue.write_buffer(&pass_gpu.params, 0, &pass.params);
     }
 
-    // Reset handling.
+    // Reset: back to generation (or straight to live when the planet came from the cache).
     if runtime.reset_generation != Some(control.reset_generation()) {
         runtime.reset_generation = Some(control.reset_generation());
         runtime.step = 0;
         runtime.time = 0.0;
-        // Step 0 always runs on reset, even while paused, so OnReset passes initialise
-        // the fields.
-        runtime.plan.push((0, 0));
+        runtime.phase = if control.skip_generation {
+            info!("sim: planet restored from cache, skipping generation");
+            SimPhase::Live
+        } else {
+            info!(
+                "sim: generating ({} steps)",
+                control.generation_steps.max(1)
+            );
+            SimPhase::Generate
+        };
     }
 
-    if !control.paused {
-        let steps = control.steps_per_frame.min(MAX_STEPS_PER_FRAME);
-        let already = runtime.plan.len() as u64;
-        for i in already..(already + steps as u64).min(MAX_STEPS_PER_FRAME as u64) {
-            let step = runtime.step + i;
-            runtime.plan.push((i as u32, step));
+    let max = MAX_STEPS_PER_FRAME as u64;
+    let runtime = &mut *runtime;
+    if runtime.phase == SimPhase::Generate {
+        let target = control.generation_steps.max(1);
+        // Step 0 runs even while paused, so OnReset passes initialise the fields.
+        let budget = match (control.paused, runtime.step) {
+            (true, 0) => 1,
+            (true, _) => 0,
+            (false, _) => (control.generation_steps_per_frame as u64).clamp(1, max),
+        };
+        while (runtime.plan.len() as u64) < budget && runtime.step < target {
+            let step = runtime.step;
+            let slot = runtime.plan.len() as u32;
+            runtime.plan.push(Planned {
+                slot,
+                step,
+                phase: SimPhase::Generate,
+                finish_generation: step + 1 == target,
+            });
+            runtime.step += 1;
+        }
+        if runtime.step >= target {
+            runtime.phase = SimPhase::Live;
+            runtime.step = 0;
+            runtime.generations_completed += 1;
+            info!("sim: generation finished");
+        }
+    }
+    if runtime.phase == SimPhase::Live && !control.paused {
+        let room = max - runtime.plan.len() as u64;
+        for _ in 0..(control.steps_per_frame as u64).min(room) {
+            let step = runtime.step;
+            let slot = runtime.plan.len() as u32;
+            runtime.plan.push(Planned {
+                slot,
+                step,
+                phase: SimPhase::Live,
+                finish_generation: false,
+            });
+            runtime.step += 1;
         }
     }
 
     // Upload one globals slot per planned step.
     if !runtime.plan.is_empty() {
         let mut bytes = vec![0u8; runtime.plan.len() * GLOBALS_SLOT as usize];
-        for (n, &(_, step)) in runtime.plan.iter().enumerate() {
+        for (n, planned) in runtime.plan.iter().enumerate() {
             let globals = SimGlobals {
                 resolution: graph.resolution,
-                step: step as u32,
+                step: planned.step as u32,
                 seed: control.seed,
                 total_steps: (runtime.total_steps + n as u64) as u32,
                 dt: control.dt,
@@ -201,13 +270,17 @@ fn prepare_sim(
         queue.write_buffer(&gpu.globals, 0, &bytes);
 
         let planned = runtime.plan.len() as u64;
-        // The step counter after this frame is the last planned step + 1.
-        runtime.step = runtime.plan.last().unwrap().1 + 1;
         runtime.total_steps += planned;
         runtime.time += control.dt * planned as f32;
     }
 
-    stats.publish(runtime.step, runtime.total_steps, runtime.ready);
+    stats.publish(
+        runtime.step,
+        runtime.total_steps,
+        runtime.ready,
+        runtime.phase == SimPhase::Generate,
+        runtime.generations_completed,
+    );
 }
 
 fn create_gpu(
@@ -369,48 +442,63 @@ fn run_sim(
     let groups = graph.resolution.div_ceil(WORKGROUP_SIZE);
     let encoder = render_context.command_encoder();
 
-    for &(slot, step) in &runtime.plan {
-        for (pass, pass_gpu) in graph.passes.iter().zip(&gpu.passes) {
-            let due = match pass.trigger {
-                PassTrigger::OnReset => step == 0,
-                PassTrigger::EveryStep => true,
-                PassTrigger::EveryNSteps(n) => step.is_multiple_of(n.max(1) as u64),
-            };
-            if !due {
+    let mut dispatch = |pass: &super::SimPass, pass_gpu: &PassGpu, slot: u32| {
+        let (Some(pipeline), Some(bind_group)) = (
+            pipeline_cache.get_compute_pipeline(pass_gpu.pipeline),
+            pass_gpu.bind_group.as_ref(),
+        ) else {
+            return;
+        };
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some(pass.label),
+                ..default()
+            });
+            cpass.set_pipeline(pipeline);
+            cpass.set_bind_group(0, bind_group, &[slot * GLOBALS_SLOT as u32]);
+            cpass.dispatch_workgroups(groups, groups, CUBE_FACES);
+        }
+        // Publish double-buffered writes so the next pass (and rendering) sees them.
+        for binding in &pass.bindings {
+            if binding.access != FieldAccess::Write || !pass.reads(binding.field) {
                 continue;
             }
-            let (Some(pipeline), Some(bind_group)) = (
-                pipeline_cache.get_compute_pipeline(pass_gpu.pipeline),
-                pass_gpu.bind_group.as_ref(),
+            let field = &fields.0[binding.field];
+            let (Some(back), Some(front)) = (
+                field.back.as_ref().and_then(|h| gpu_images.get(h)),
+                gpu_images.get(&field.front),
             ) else {
                 continue;
             };
-            {
-                let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some(pass.label),
-                    ..default()
-                });
-                cpass.set_pipeline(pipeline);
-                cpass.set_bind_group(0, bind_group, &[slot * GLOBALS_SLOT as u32]);
-                cpass.dispatch_workgroups(groups, groups, CUBE_FACES);
-            }
-            // Publish double-buffered writes so the next pass (and rendering) sees them.
-            for binding in &pass.bindings {
-                if binding.access != FieldAccess::Write || !pass.reads(binding.field) {
-                    continue;
-                }
-                let field = &fields.0[binding.field];
-                let (Some(back), Some(front)) = (
-                    field.back.as_ref().and_then(|h| gpu_images.get(h)),
-                    gpu_images.get(&field.front),
-                ) else {
-                    continue;
+            encoder.copy_texture_to_texture(
+                back.texture.as_image_copy(),
+                front.texture.as_image_copy(),
+                back.texture.size(),
+            );
+        }
+    };
+
+    let passes = || graph.passes.iter().zip(&gpu.passes);
+    for planned in &runtime.plan {
+        for (pass, pass_gpu) in passes() {
+            let due = pass.phase == planned.phase
+                && match pass.trigger {
+                    PassTrigger::OnReset => {
+                        planned.phase == SimPhase::Generate && planned.step == 0
+                    }
+                    PassTrigger::EveryStep => true,
+                    PassTrigger::EveryNSteps(n) => planned.step.is_multiple_of(n.max(1) as u64),
+                    PassTrigger::AfterGeneration => false,
                 };
-                encoder.copy_texture_to_texture(
-                    back.texture.as_image_copy(),
-                    front.texture.as_image_copy(),
-                    back.texture.size(),
-                );
+            if due {
+                dispatch(pass, pass_gpu, planned.slot);
+            }
+        }
+        if planned.finish_generation {
+            for (pass, pass_gpu) in passes() {
+                if pass.trigger == PassTrigger::AfterGeneration {
+                    dispatch(pass, pass_gpu, planned.slot);
+                }
             }
         }
     }
