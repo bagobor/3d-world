@@ -20,6 +20,7 @@ struct CloudParams {
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: CloudParams;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var moisture_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var cloud_noise_tex: texture_2d_array<f32>;
 
 fn load_moisture(t: vec3<u32>) -> f32 {
     return textureLoad(moisture_tex, vec2<i32>(t.xy), i32(t.z), 0).r;
@@ -72,7 +73,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let dir = normalize(in.dir);
-    let cover = cloud_coverage(dir, sample_moisture(dir), globals.time);
+    let cover = cloud_coverage(cloud_noise_tex, params.resolution, dir, sample_moisture(dir), globals.time, true);
     if cover < 0.01 {
         discard;
     }
