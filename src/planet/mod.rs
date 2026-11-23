@@ -3,6 +3,7 @@
 pub mod camera;
 pub mod fauna;
 pub mod lod;
+pub mod marine;
 pub mod mesh;
 pub mod ocean;
 pub mod sky;
@@ -348,12 +349,14 @@ impl Plugin for PlanetPlugin {
         app.add_plugins((
             MaterialPlugin::<PlanetMaterial>::default(),
             MaterialPlugin::<TerrainMaterial>::default(),
+            MaterialPlugin::<SeaMaterial>::default(),
             MaterialPlugin::<CloudMaterial>::default(),
             MaterialPlugin::<VegetationMaterial>::default(),
             MaterialPlugin::<weather::PrecipitationMaterial>::default(),
         ))
         .init_resource::<Vegetation>()
         .init_resource::<weather::Weather>()
+        .init_resource::<marine::Marine>()
         .init_resource::<fauna::Fauna>()
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
@@ -389,6 +392,9 @@ impl Plugin for PlanetPlugin {
                 ocean::update_waves.after(camera::clamp_camera),
                 weather::update_weather.after(camera::clamp_camera),
                 weather::apply_weather.after(weather::update_weather),
+                marine::update_marine
+                    .after(camera::clamp_camera)
+                    .before(camera::apply_floating_origin),
             ),
         );
     }
@@ -397,6 +403,10 @@ impl Plugin for PlanetPlugin {
 /// The terrain material, shared by every chunk.
 #[derive(Resource)]
 pub(crate) struct TerrainMaterialHandle(Handle<TerrainMaterial>);
+
+/// The sea surface material, shared by every chunk below sea level.
+#[derive(Resource)]
+pub(crate) struct SeaMaterialHandle(Handle<SeaMaterial>);
 
 /// The vegetation material, shared by every vegetation tile.
 #[derive(Resource)]
@@ -412,6 +422,9 @@ fn load_terrain_surface(
     baked: Res<BakedFields>,
     control: Res<SimControl>,
     material: Option<Res<TerrainMaterialHandle>>,
+    sea_material: Option<Res<SeaMaterialHandle>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut sea_materials: ResMut<Assets<SeaMaterial>>,
     vegetation_material: Option<Res<VegetationMaterialHandle>>,
     mut lod: ResMut<TerrainLod>,
     mut vegetation: ResMut<Vegetation>,
@@ -450,7 +463,23 @@ fn load_terrain_surface(
     {
         weather.set_planet(baked.resolution, moisture, temperature, height);
     }
-    lod.set_surface(&mut commands, surface, material.0.clone());
+    let Some(sea_material) = sea_material else {
+        return;
+    };
+    // The sea flattens chunk vertices back to sea level, which needs the exaggeration.
+    let exaggeration = lod.settings.exaggeration as f32;
+    if let Some(mut m) = terrain_materials.get_mut(&material.0) {
+        m.params.height_exaggeration = exaggeration;
+    }
+    if let Some(mut m) = sea_materials.get_mut(&sea_material.0) {
+        m.params.height_exaggeration = exaggeration;
+    }
+    lod.set_surface(
+        &mut commands,
+        surface,
+        material.0.clone(),
+        sea_material.0.clone(),
+    );
     match (baked.f32_field(BIOME), baked.f32_field(TEMPERATURE)) {
         (Some(biome), Some(temperature)) => vegetation.set_planet(
             &mut commands,
@@ -764,6 +793,78 @@ pub struct TerrainMaterial {
     pub moisture: Handle<Image>,
 }
 
+impl From<&TerrainMaterial> for SeaMaterial {
+    fn from(t: &TerrainMaterial) -> Self {
+        Self {
+            height: t.height.clone(),
+            params: t.params,
+            water: t.water.clone(),
+            discharge: t.discharge.clone(),
+            temperature: t.temperature.clone(),
+            biome: t.biome.clone(),
+            plants: t.plants.clone(),
+            fire: t.fire.clone(),
+            moisture: t.moisture.clone(),
+        }
+    }
+}
+
+impl Material for SeaMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/planet/planet_material.wesl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/planet/planet_material.wesl".into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let vertex_layout = layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+            lod::ATTRIBUTE_SURFACE.at_shader_location(2),
+        ])?;
+        descriptor.vertex.buffers = vec![vertex_layout];
+        descriptor.vertex.entry_point = Some("sea_vertex".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.entry_point = Some("sea_fragment".into());
+        }
+        // Seen from above and, diving, from below.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// The sea surface over LOD terrain chunks: the chunk meshes again, flattened to sea level
+/// and moved by the waves (`sea_vertex` / `sea_fragment`). Same bindings as
+/// [`TerrainMaterial`].
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct SeaMaterial {
+    #[texture(0, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub height: Handle<Image>,
+    #[uniform(1)]
+    pub params: PlanetMaterialParams,
+    #[texture(2, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub water: Handle<Image>,
+    #[texture(3, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub discharge: Handle<Image>,
+    #[texture(4, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub temperature: Handle<Image>,
+    #[texture(5, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub biome: Handle<Image>,
+    #[texture(6, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub plants: Handle<Image>,
+    #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub fire: Handle<Image>,
+    #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub moisture: Handle<Image>,
+}
+
 impl Material for TerrainMaterial {
     fn vertex_shader() -> ShaderRef {
         "shaders/planet/planet_material.wesl".into()
@@ -877,6 +978,7 @@ fn spawn_planet(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PlanetMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut sea_materials: ResMut<Assets<SeaMaterial>>,
     mut cloud_materials: ResMut<Assets<CloudMaterial>>,
     mut vegetation_materials: ResMut<Assets<VegetationMaterial>>,
 ) {
@@ -925,6 +1027,8 @@ fn spawn_planet(
             wave_phases: [Vec4::ZERO; 2],
         },
     });
+    let sea = sea_materials.add(SeaMaterial::from(terrain_materials.get(&terrain).unwrap()));
+    commands.insert_resource(SeaMaterialHandle(sea));
     commands.insert_resource(TerrainMaterialHandle(terrain));
     let material = materials.add(PlanetMaterial {
         height: fields.front(HEIGHT),

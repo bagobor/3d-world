@@ -332,14 +332,6 @@ fn terrain_vertex(in: TerrainVertex) -> TerrainOutput {
     var world = mesh_position_local_to_world(world_from_local, vec4(in.position, 1.0));
     var out: TerrainOutput;
     out.rest = world.xyz;
-    if in.surface.w < 0.0 && material.show_biomes > 0.5 {
-        // Waves, faded out where the mesh is too coarse to carry them (chunks near the
-        // camera have roughly distance / 40 between vertices).
-        let up = normalize(in.surface.xyz);
-        let scale = sea_state(up) * smoothstep(0.0, 4.0, -in.surface.w);
-        let sea = gerstner(world.xyz, up, scale, length(world.xyz) / 40.0);
-        world = vec4(world.xyz + sea.offset, 1.0);
-    }
     out.clip_position = position_world_to_clip(world.xyz);
     out.world_position = world;
     out.world_normal = mesh_normal_local_to_world(in.normal, in.instance_index);
@@ -353,7 +345,122 @@ fn terrain_fragment(in: TerrainOutput) -> @location(0) vec4<f32> {
     // Chunks are only translated, so world and planet-local normals agree.
     let n = normalize(in.world_normal);
     let pixel_m = length(fwidth(in.world_position.xyz));
+    if in.surface.w < 0.0 && material.show_biomes > 0.5 {
+        return seabed(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.clip_position, pixel_m);
+    }
     return shade(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.rest, in.clip_position, pixel_m);
+}
+
+// The sea surface: the chunk mesh again, each vertex dropped (or raised) back to sea level,
+// then moved by the waves. Skirt vertices (normals stretched to 1 + skirt depth) are folded
+// back up so they don't hang down into the water.
+@vertex
+fn sea_vertex(in: TerrainVertex) -> TerrainOutput {
+    let world_from_local = get_world_from_local(in.instance_index);
+    var world = mesh_position_local_to_world(world_from_local, vec4(in.position, 1.0));
+    let up = normalize(in.surface.xyz);
+    let skirt = max(length(in.normal) - 1.0, 0.0);
+    world = vec4(world.xyz + up * (skirt - in.surface.w * material.height_exaggeration), 1.0);
+    var out: TerrainOutput;
+    out.rest = world.xyz;
+    // Waves, faded out where the mesh is too coarse to carry them (chunks near the camera
+    // have roughly distance / 40 between vertices) and toward the shore.
+    let scale = sea_state(up) * smoothstep(0.0, 4.0, -in.surface.w);
+    let sea = gerstner(world.xyz, up, scale, length(world.xyz) / 40.0);
+    world = vec4(world.xyz + sea.offset, 1.0);
+    out.clip_position = position_world_to_clip(world.xyz);
+    out.world_position = world;
+    out.world_normal = up;
+    out.surface = in.surface;
+    return out;
+}
+
+@fragment
+fn sea_fragment(in: TerrainOutput) -> @location(0) vec4<f32> {
+    // Over land the sea surface runs under the ground; cut it at the coastline.
+    if in.surface.w > 0.0 {
+        discard;
+    }
+    let dir = normalize(in.surface.xyz);
+    let pixel_m = length(fwidth(in.world_position.xyz));
+    // The camera is at the origin: below the surface when the surface is above it.
+    if dot(in.world_position.xyz, dir) > 0.0 {
+        return sea_from_below(dir, in.surface.w, in.world_position, in.rest, in.clip_position, pixel_m);
+    }
+    return shade(dir, in.surface.w, 0.0, dir, in.world_position, in.rest, in.clip_position, pixel_m);
+}
+
+// Light reaching depth `depth_m`, per channel: red goes first, blue-green last.
+fn water_transmittance(depth_m: f32) -> vec3<f32> {
+    return exp(-max(depth_m, 0.0) * vec3(0.35, 0.07, 0.05));
+}
+
+// Dancing caustics: sunlight focused by the waves, a few metres across, fading with depth.
+fn caustics(dir: vec3<f32>, depth_m: f32) -> f32 {
+    let p = dir * material.planet_radius_m;
+    let t = globals.time * 0.6;
+    let a = gradient_noise(p / 3.0 + vec3(t, 0.0, t * 0.7), 901u);
+    let b = gradient_noise(p / 2.2 - vec3(t * 0.8, t * 0.5, 0.0), 902u);
+    let lines = pow(clamp(1.0 - abs(a + b) * 0.8, 0.0, 1.0), 6.0);
+    return lines * exp(-depth_m / 18.0);
+}
+
+// The seabed: sand in the shallows, mud deeper, rock on slopes; tinted and darkened by the
+// water above it, with caustics. Only seen when diving, since the sea surface is opaque.
+fn seabed(
+    dir: vec3<f32>,
+    h: f32,
+    slope: f32,
+    n: vec3<f32>,
+    world_position: vec4<f32>,
+    clip_position: vec4<f32>,
+    pixel_m: f32,
+) -> vec4<f32> {
+    let depth = -h;
+    let ripples = detail_noise(dir, pixel_m, 950u);
+    var c = mix(vec3(0.76, 0.70, 0.52), vec3(0.32, 0.30, 0.25), smoothstep(20.0, 120.0, depth));
+    c *= 0.85 + 0.3 * ripples;
+    c = mix(c, vec3(0.30, 0.30, 0.28), smoothstep(0.35, 0.6, slope * 3.0));
+    c = c * water_transmittance(depth) * (1.0 + 2.5 * caustics(dir, depth));
+
+    var pbr: PbrInput = pbr_input_new();
+    pbr.material.base_color = vec4(c, 1.0);
+    pbr.material.perceptual_roughness = 0.9;
+    pbr.material.metallic = 0.0;
+    pbr.flags = MESH_FLAGS_SHADOW_RECEIVER_BIT;
+    pbr.frag_coord = clip_position;
+    pbr.world_position = world_position;
+    pbr.world_normal = n;
+    pbr.N = n;
+    pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
+    pbr.V = fns::calculate_view(world_position, pbr.is_orthographic);
+    let lit = with_haze(fns::apply_pbr_lighting(pbr), world_position.xyz, clip_position.xy);
+    return tone_mapping(lit, view.color_grading);
+}
+
+// The underside of the sea surface. Looking up steeply you see the bright sky through
+// Snell's window (~49° half-angle); outside it, total internal reflection mirrors the dim
+// water below.
+fn sea_from_below(
+    dir: vec3<f32>,
+    h: f32,
+    world_position: vec4<f32>,
+    rest: vec3<f32>,
+    clip_position: vec4<f32>,
+    pixel_m: f32,
+) -> vec4<f32> {
+    let sea = gerstner(rest, dir, sea_state(dir), pixel_m);
+    let n = ocean_normal(dir, sea.normal, pixel_m);
+    let v = normalize(world_position.xyz);
+    let cos_up = dot(v, n);
+    let window = smoothstep(0.62, 0.70, cos_up);
+    let sun = max(dot(lights.directional_lights[0].direction_to_light, dir), 0.0);
+    // Luminance in the same physical units as the sky (Exposure::SUNLIGHT).
+    let sky = vec3(0.55, 0.80, 0.90) * 9000.0 * (0.3 + 0.7 * sun);
+    let reflected = vec3(0.02, 0.10, 0.12) * 3000.0 * (0.3 + 0.7 * sun);
+    var color = mix(reflected, sky, window) * view.exposure;
+    let lit = with_haze(vec4(color, 1.0), world_position.xyz, clip_position.xy);
+    return tone_mapping(lit, view.color_grading);
 }
 
 struct Sea {

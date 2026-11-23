@@ -30,6 +30,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|---|
 | ![rain](docs/rain.png) | ![snowfall](docs/snowfall.png) | ![storm](docs/storm.png) |
 
+| reef | kelp |
+|---|---|
+| ![reef](docs/reef.png) | ![kelp](docs/kelp.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -87,7 +91,8 @@ Camera modes, switched with **1 / 2 / 3**:
 - **2 Fly**: free flight. **Left-click** captures the mouse for looking around (**Esc**
   releases it; **right-drag** also looks). **WASD** flies along the view, **E/Q** up and
   down, **Shift** faster, **scroll** sets the speed. Speed grows with height above the
-  ground, from 15 m/s near it to hundreds of km/s in space.
+  ground, from 15 m/s near it to hundreds of km/s in space. Fly down through the sea surface
+  to dive, as deep as the seabed.
 - **3 Walk**: on foot at 1.7 m eye height, following the terrain (on the ocean, on its
   surface). Mouse look as in fly mode, **WASD** walks, **Shift** runs, **Space** jumps.
 
@@ -99,14 +104,15 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves fifteen views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves seventeen views, `planet.png` (whole planet),
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
 view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
 nearest grassland), `fly.png` (fly mode, 600 m up), `walk.png` (walk mode, eye height) and
 `herd.png` (next to the nearest herd), `peaks.png` (the highest summit outside the polar
 caps, from 25 km) `canyon.png` (down in the deepest canyon in view), `sea.png` (7 m above open sea) and
 `coast.png` (in the shallows, looking at a beach), and `rain.png`, `snowfall.png` and
-`storm.png` (placed, when their turn comes, where the weather is doing that in daylight;
+`storm.png`, and `reef.png` and `kelp.png` (diving 3.5 m down over a warm or cool shallow
+sea) (placed, when their turn comes, where the weather is doing that in daylight;
 the clock stops until the shot is taken because clouds drift fast), each once its terrain and vegetation have streamed in
 (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
@@ -335,6 +341,24 @@ which mirrors `cloud_field.wesl` on the CPU to know the weather at the camera).
 - **Storms**: darker, thicker clouds, a dimmer sun, much rougher seas, and lightning:
   random flashes inside storm clouds (visible from orbit on the night side) and, under a
   storm, double-flicker flashes that light the whole scene.
+
+### Under water
+
+The terrain chunks mesh the seabed too; the sea surface is the same mesh drawn again with
+its own material (`sea_vertex`/`sea_fragment` in `planet_material.wesl`), flattened to sea
+level and moved by the waves, and cut away over land.
+
+- **Diving** (fly mode below sea level): blue-green fog with ~60 m visibility that darkens
+  with depth, sunlight fading as exp(-depth / 25 m), and the surface seen from below:
+  bright sky through Snell's window overhead, dim total internal reflection around it.
+- **Seabed**: sand in the shallows, mud deeper, rock on slopes, tinted by the water column
+  (red goes first) with moving caustics.
+- **Sea life** (`planet/marine.rs`): placed per ~150 m quadtree cell within 260 m of the
+  camera while it is near sea level, deterministic per cell. Coral (simple coloured shapes)
+  grows in warm water under 30 m, kelp in cool water 3-35 m deep, reaching up to the
+  surface. Fish schools swim everywhere less than 250 m deep, most over reefs: each school
+  wanders at its preferred depth and turns back home, and its fish keep loose formation and
+  wag their tails. While diving, a school is brought in when none is in view.
 
 ### Vegetation
 
