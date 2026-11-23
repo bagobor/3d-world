@@ -50,6 +50,13 @@ pub const TEMPERATURE: &str = "temperature";
 pub const BIOME: &str = "biome";
 /// Live plant cover: r grass, g shrubs, b trees (0..1 each), a fuel (dead litter).
 pub const PLANTS: &str = "plants";
+/// The plant cover the renderers draw, laid out as [`PLANTS`] (a unused): shrubs and trees
+/// at their long-run cover, so ecosystem cycles don't make plants swell and shrink; fire
+/// still burns them at once (see `shaders/planet/plants_settle.wesl`).
+pub const PLANTS_SHOWN: &str = "plants_shown";
+/// The long-run shrub and tree cover behind [`PLANTS_SHOWN`], two smoothing stages: r, g
+/// the first, b, a the second.
+pub const PLANTS_LAG: &str = "plants_lag";
 /// Live fire intensity (0..1) burning this step.
 pub const FIRE: &str = "fire";
 /// Live animal populations: r grazers, g predators (density, ~1 = what the best pasture
@@ -120,6 +127,8 @@ const MOISTURE_SPREAD: &str = "moisture_spread";
 const GENERATION_FINALIZE: &str = "generation_finalize";
 const PLANTS_INIT: &str = "plants_init";
 const PLANTS_GROW: &str = "plants_grow";
+const PLANTS_SETTLE_INIT: &str = "plants_settle_init";
+const PLANTS_SETTLE: &str = "plants_settle";
 const FIRE_SPREAD: &str = "fire_spread";
 const ANIMALS_INIT: &str = "animals_init";
 const CLOUD_BAKE: &str = "cloud_bake";
@@ -245,7 +254,10 @@ pub struct PlantParams {
     pub burn_tree: f32,
     pub subtropic_dryness: f32,
     pub lake_depth_m: f32,
-    pub _pad: [f32; 2],
+    /// Per step, how far each of the two smoothing stages of [`PLANTS_SHOWN`] moves towards
+    /// the live shrub and tree cover.
+    pub settle_rate: f32,
+    pub _pad: f32,
 }
 
 impl Default for PlantParams {
@@ -266,7 +278,10 @@ impl Default for PlantParams {
             burn_tree: 0.6,
             subtropic_dryness: env.subtropic_dryness,
             lake_depth_m: env.lake_depth_m,
-            _pad: [0.0; 2],
+            // About 25 years per stage: grazer cycles (~13 years) are smoothed away, forests
+            // still spread and retreat on screen.
+            settle_rate: 1.0 / 300.0,
+            _pad: 0.0,
         }
     }
 }
@@ -522,6 +537,17 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
     let plants = PlantParams::default();
     let animals = AnimalParams::default();
     let generate = |pass: SimPass| pass.phase(SimPhase::Generate);
+    // Both entry points of plants_settle.wesl share one binding layout.
+    let settle = |entry: &'static str| {
+        SimPass::new(entry, "shaders/planet/plants_settle.wesl", entry)
+            .read(PLANTS)
+            .read(FIRE)
+            .read(PLANTS_LAG)
+            .read(PLANTS_SHOWN)
+            .write(PLANTS_LAG)
+            .write(PLANTS_SHOWN)
+            .with_params(plants)
+    };
     graph
         .add_field(HEIGHT, FieldFormat::R32Float)
         .add_field(WATER, FieldFormat::R32Float)
@@ -532,6 +558,8 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         .add_field(TEMPERATURE, FieldFormat::R32Float)
         .add_field(BIOME, FieldFormat::R32Float)
         .add_field(PLANTS, FieldFormat::Rgba32Float)
+        .add_field(PLANTS_SHOWN, FieldFormat::Rgba32Float)
+        .add_field(PLANTS_LAG, FieldFormat::Rgba32Float)
         .add_field(FIRE, FieldFormat::R32Float)
         .add_field(ANIMALS, FieldFormat::Rgba32Float)
         .add_field(CLOUD_NOISE, FieldFormat::Rgba16Float)
@@ -651,6 +679,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .trigger(PassTrigger::OnReset)
             .with_params(plants),
         )
+        .add_pass(settle(PLANTS_SETTLE_INIT).trigger(PassTrigger::OnReset))
         .add_pass(
             SimPass::new(
                 ANIMALS_INIT,
@@ -696,6 +725,8 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .write(PLANTS)
             .with_params(plants),
         )
+        // Before fire_spread, so it sees the fire plants_grow just burned.
+        .add_pass(settle(PLANTS_SETTLE))
         .add_pass(
             SimPass::new(
                 FIRE_SPREAD,
@@ -1003,7 +1034,7 @@ fn spawn_planet(
     let radius = TerrainParams::default().planet_radius_m;
     let vegetation = vegetation_materials.add(VegetationMaterial {
         params: VegetationParams::new(radius, graph.resolution as f32),
-        plants: fields.front(PLANTS),
+        plants: fields.front(PLANTS_SHOWN),
         temperature: fields.front(TEMPERATURE),
         moisture: fields.front(MOISTURE),
         cloud_noise: fields.front(CLOUD_NOISE),
@@ -1034,7 +1065,7 @@ fn spawn_planet(
         discharge: fields.front(DISCHARGE),
         temperature: fields.front(TEMPERATURE),
         biome: fields.front(BIOME),
-        plants: fields.front(PLANTS),
+        plants: fields.front(PLANTS_SHOWN),
         fire: fields.front(FIRE),
         moisture: fields.front(MOISTURE),
         cloud_noise: fields.front(CLOUD_NOISE),
@@ -1057,7 +1088,7 @@ fn spawn_planet(
         discharge: fields.front(DISCHARGE),
         temperature: fields.front(TEMPERATURE),
         biome: fields.front(BIOME),
-        plants: fields.front(PLANTS),
+        plants: fields.front(PLANTS_SHOWN),
         fire: fields.front(FIRE),
         moisture: fields.front(MOISTURE),
         cloud_noise: fields.front(CLOUD_NOISE),

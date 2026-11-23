@@ -228,9 +228,16 @@ fires burn) and `fire` (intensity burning this step). One live step is roughly a
    both in proportion to flammability (fuel, dryness, warmth). A burnt texel has no fuel, so
    fires leave firebreaks and burn out; in dry grassland and savanna they recur and keep
    the land open, in wet forest they hardly start.
+4. `plants_settle` (between the two): `plants_shown`, the cover the renderers draw. Grazer
+   and predator cycles move shrub cover by up to ~0.4 over a decade or so, which at
+   time-lapse speed would make plants swell and shrink every second. So shrubs and trees are
+   drawn at their long-run cover: the live cover through two smoothing stages of about 25
+   years each (`settle_rate`, both in `plants_lag`). Fire is taken off at once; burnt plants
+   regrow on screen as fast as the live cover does, back up to the long-run cover. Grass is
+   shown as it is.
 
 Constants are in `PlantParams`. The planet material draws bare ground by biome, then grass,
-shrubs and trees by cover, and fires as an emissive glow.
+shrubs and trees by shown cover, and fires as an emissive glow.
 
 ### Animal populations
 

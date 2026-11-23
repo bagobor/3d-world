@@ -20,8 +20,8 @@ struct PlantParams {
     burn_tree: f32,
     subtropic_dryness: f32, // same as EnvParams, for precipitation()
     lake_depth_m: f32,
-    _pad0: f32,
-    _pad1: f32,
+    settle_rate: f32,      // per step, each smoothing stage of `plants_shown` (plants_settle.wesl)
+    _pad: f32,
 }
 
 const BIOME_OCEAN: f32 = 0.0;
