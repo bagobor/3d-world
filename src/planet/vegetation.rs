@@ -4,8 +4,9 @@
 //! layer, on a jittered grid that is global to each cube face (so near and far tree tiles
 //! agree on where every tree stands). The CPU only knows which biomes *can* hold a plant;
 //! whether it is there right now is up to the live ecosystem: the vertex shader reads the
-//! `plants` field and grows each plant in when the local cover exceeds the plant's random
-//! threshold, so forests spread, thin and burn on screen as the simulation runs.
+//! `plants_shown` field (the live cover, smoothed so ecosystem cycles don't show) and grows
+//! each plant in when the local cover exceeds the plant's random threshold, so forests
+//! spread, thin and burn on screen as the simulation runs.
 //!
 //! Trees come in two layers: detailed meshes up close, and cheap ones out to a few
 //! kilometres, switched per tree at [`TREE_SWITCH_M`].

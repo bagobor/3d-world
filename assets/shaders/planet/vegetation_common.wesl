@@ -54,9 +54,10 @@ fn sample_field(field: u32, dir: vec3<f32>) -> vec4<f32> {
     return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
 }
 
-// How far a plant is grown in (0..1): by the live cover of its type against the plant's
-// threshold, faded out towards its layer's draw distance, and switched between the near
-// and far tree meshes. `distance` is from the camera (the world origin).
+// How far a plant is grown in (0..1): by the shown cover of its type (`plants_shown`, see
+// plants_settle.wesl) against the plant's threshold, faded out towards its layer's draw
+// distance, and switched between the near and far tree meshes. `distance` is from the
+// camera (the world origin).
 fn plant_scale(code: u32, threshold: f32, up: vec3<f32>, distance: f32) -> f32 {
     let kind = code & 3u;
     let far = (code >> 3u) & 1u;
