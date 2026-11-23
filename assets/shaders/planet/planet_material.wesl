@@ -185,6 +185,11 @@ fn detail_noise(dir: vec3<f32>, pixel_m: f32, seed: u32) -> f32 {
     var amp = 0.3;
     var wavelength = 6000.0;
     for (var i = 0u; i < 9u; i++) {
+        // Octaves shrink, so once one is under two pixels it and all later ones fade to
+        // zero: stop instead of evaluating noise that contributes nothing.
+        if wavelength <= 2.0 * pixel_m {
+            break;
+        }
         let fade = smoothstep(2.0 * pixel_m, 8.0 * pixel_m, wavelength);
         sum += amp * fade * gradient_noise(p / wavelength, seed + i * 31u);
         wavelength *= 0.4;
@@ -524,6 +529,10 @@ fn ocean_normal(dir: vec3<f32>, flat_n: vec3<f32>, pixel_m: f32) -> vec3<f32> {
     var wavelength = 120.0;
     var amp = 0.12;
     for (var i = 0u; i < 5u; i++) {
+        // As in `detail_noise`: the remaining octaves are all under two pixels.
+        if wavelength <= 2.0 * pixel_m {
+            break;
+        }
         let fade = smoothstep(2.0 * pixel_m, 8.0 * pixel_m, wavelength);
         let q = p / wavelength + vec3(globals.time * 0.6, 0.0, globals.time * 0.4) / (1.0 + f32(i));
         let e = 0.15;
