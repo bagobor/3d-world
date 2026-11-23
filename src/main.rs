@@ -122,7 +122,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon] [--no-shadows]"
+                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon,sea,coast] [--no-shadows]"
                     );
                     std::process::exit(0);
                 }
@@ -603,6 +603,38 @@ fn shots(
     } else {
         warn!("headless: no canyon found in view");
     }
+    // At sea: just offshore, a few metres above the waves, looking along the coast.
+    let sea_dir = find(&|d| {
+        let h = surface.height.sample(d);
+        (-600.0..-150.0).contains(&h)
+    });
+    let mut sea = *start;
+    sea.dir = sea_dir;
+    sea.heading = 0.4;
+    sea.pitch = -0.12;
+    sea.altitude_m = 7.0;
+    sea.mode = camera::CameraMode::Fly;
+    // The coast: in the shallows 300 m from a beach, looking at it, to see the surf.
+    let shore_heading = |d: DVec3| -> Option<f64> {
+        let mut c = sea;
+        c.dir = d;
+        (0..16)
+            .map(|k| k as f64 / 16.0 * std::f64::consts::TAU)
+            .find(|&heading| {
+                c.dir = d;
+                c.heading = heading;
+                c.move_by(300.0, 0.0);
+                (2.0..40.0).contains(&surface.height(c.dir, 50.0))
+            })
+    };
+    let shallows =
+        find(&|d| (-6.0..-1.0).contains(&surface.height(d, 50.0)) && shore_heading(d).is_some());
+    let mut coast = sea;
+    coast.dir = shallows;
+    coast.heading = shore_heading(shallows).unwrap_or(0.0);
+    coast.move_by(-150.0, 0.0);
+    coast.altitude_m = 5.0;
+    coast.pitch = -0.08;
     vec![
         ("planet", *start),
         ("orbit", orbit),
@@ -615,6 +647,8 @@ fn shots(
         ("herd", meadow),
         ("peaks", peaks),
         ("canyon", canyon),
+        ("sea", sea),
+        ("coast", coast),
     ]
 }
 
