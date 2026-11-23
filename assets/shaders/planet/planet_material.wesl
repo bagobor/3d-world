@@ -25,7 +25,15 @@ struct PlanetMaterialParams {
     river_discharge: f32,
     // 1 once the static maps exist (after generation or a cache load).
     show_biomes: f32,
+    // Gerstner waves near the camera (src/planet/ocean.rs): wave vector (rad/m) and
+    // amplitude (m), and each wave's phase at the camera.
+    waves: array<vec4<f32>, 8>,
+    wave_phases: array<vec4<f32>, 2>,
 }
+
+const WAVE_COUNT: u32 = 8u;
+// Horizontal sharpness of the wave crests (0 = sine waves, 1 = the steepest Gerstner).
+const WAVE_SHARPNESS: f32 = 0.8;
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var height_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var<uniform> material: PlanetMaterialParams;
@@ -298,7 +306,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let world_n = normalize(mesh_normal_local_to_world(local_n, in.instance_index));
     let pixel_m = length(fwidth(in.world_position.xyz));
-    return shade(dir, h, 1.0 - dot(local_n, dir), world_n, in.world_position, in.clip_position, pixel_m);
+    return shade(dir, h, 1.0 - dot(local_n, dir), world_n, in.world_position, in.world_position.xyz, in.clip_position, pixel_m);
 }
 
 struct TerrainVertex {
@@ -314,13 +322,24 @@ struct TerrainOutput {
     @location(0) world_position: vec4<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) surface: vec4<f32>,
+    // Camera-relative position before the waves move it (the waves' own coordinates).
+    @location(3) rest: vec3<f32>,
 };
 
 @vertex
 fn terrain_vertex(in: TerrainVertex) -> TerrainOutput {
     let world_from_local = get_world_from_local(in.instance_index);
-    let world = mesh_position_local_to_world(world_from_local, vec4(in.position, 1.0));
+    var world = mesh_position_local_to_world(world_from_local, vec4(in.position, 1.0));
     var out: TerrainOutput;
+    out.rest = world.xyz;
+    if in.surface.w < 0.0 && material.show_biomes > 0.5 {
+        // Waves, faded out where the mesh is too coarse to carry them (chunks near the
+        // camera have roughly distance / 40 between vertices).
+        let up = normalize(in.surface.xyz);
+        let scale = sea_state(up) * smoothstep(0.0, 4.0, -in.surface.w);
+        let sea = gerstner(world.xyz, up, scale, length(world.xyz) / 40.0);
+        world = vec4(world.xyz + sea.offset, 1.0);
+    }
     out.clip_position = position_world_to_clip(world.xyz);
     out.world_position = world;
     out.world_normal = mesh_normal_local_to_world(in.normal, in.instance_index);
@@ -334,7 +353,52 @@ fn terrain_fragment(in: TerrainOutput) -> @location(0) vec4<f32> {
     // Chunks are only translated, so world and planet-local normals agree.
     let n = normalize(in.world_normal);
     let pixel_m = length(fwidth(in.world_position.xyz));
-    return shade(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.clip_position, pixel_m);
+    return shade(dir, in.surface.w, 1.0 - dot(n, dir), n, in.world_position, in.rest, in.clip_position, pixel_m);
+}
+
+struct Sea {
+    // Displacement of the surface point, camera-relative world space (m).
+    offset: vec3<f32>,
+    normal: vec3<f32>,
+    // 0..1: how compressed the surface is at a crest, where waves break into whitecaps.
+    crest: f32,
+}
+
+// Wave height relative to a calm sea: rougher under heavy cloud (storms).
+fn sea_state(dir: vec3<f32>) -> f32 {
+    let cover = cloud_coverage(dir, sample_field(MOISTURE, dir), globals.time);
+    return 0.7 + 1.9 * smoothstep(0.45, 0.95, cover);
+}
+
+// Sum of Gerstner waves at camera-relative rest position `rest` with local vertical `up`.
+// Waves shorter than a few `resolution_m` fade out (their effect goes into roughness).
+fn gerstner(rest: vec3<f32>, up: vec3<f32>, scale: f32, resolution_m: f32) -> Sea {
+    var offset = vec3(0.0);
+    var tilt = vec3(0.0);
+    var pinch = 0.0;
+    for (var i = 0u; i < WAVE_COUNT; i++) {
+        let w = material.waves[i];
+        // The wave vectors are tangent at the camera; re-project them for this point.
+        let kv = w.xyz - up * dot(w.xyz, up);
+        let k = length(kv);
+        if k < 1e-6 {
+            continue;
+        }
+        let d = kv / k;
+        let fade = smoothstep(2.0 * resolution_m, 6.0 * resolution_m, 6.2831853 / k);
+        let a = w.w * scale * fade;
+        let theta = dot(w.xyz, rest) + material.wave_phases[i / 4u][i % 4u];
+        let c = cos(theta);
+        let s = sin(theta);
+        offset += d * (WAVE_SHARPNESS * a * c) + up * (a * s);
+        tilt += d * (k * a * c);
+        pinch += WAVE_SHARPNESS * k * a * s;
+    }
+    var sea: Sea;
+    sea.offset = offset;
+    sea.normal = normalize(up * (1.0 - pinch) - tilt);
+    sea.crest = clamp(pinch, 0.0, 1.0);
+    return sea;
 }
 
 // Wave normal for the ocean: a few octaves of moving noise, tilting the flat sea surface.
@@ -372,6 +436,7 @@ fn shade(
     slope: f32,
     world_n: vec3<f32>,
     world_position: vec4<f32>,
+    rest: vec3<f32>,
     clip_position: vec4<f32>,
     pixel_m: f32,
 ) -> vec4<f32> {
@@ -398,11 +463,28 @@ fn shade(
         let depth = -h;
         let deep = 1.0 - exp(-depth / 80.0);
         color = mix(vec3(0.03, 0.22, 0.24), vec3(0.003, 0.025, 0.07), deep);
-        let surf = (1.0 - smoothstep(0.5, 4.0, depth)) * smoothstep(-0.2, 0.4, detail_noise(dir, pixel_m, 300u) + 0.2);
-        color = mix(color, vec3(0.8, 0.85, 0.85), surf * 0.7);
-        n = ocean_normal(dir, n, pixel_m);
+        // Waves: the same Gerstner set as the vertex stage (which only moves vertices where
+        // the mesh is fine enough), with small noise ripples on top.
+        let scale = sea_state(dir) * smoothstep(0.0, 4.0, depth);
+        let sea = gerstner(rest, dir, scale, pixel_m);
+        n = ocean_normal(dir, sea.normal, pixel_m);
+        // At grazing angles a tilted wave would mirror the sky below the horizon (the
+        // atmosphere's brown "ground"), where really it would see the next wave. Tilt such
+        // normals back toward the vertical so reflections stay above the horizon.
+        let v = normalize(-world_position.xyz);
+        let below = smoothstep(0.08, -0.15, dot(reflect(-v, n), dir));
+        n = normalize(mix(n, dir, below));
+        // Whitecaps where crests pinch, streaky, more of them in rough seas.
+        let streaks = smoothstep(0.0, 0.6, detail_noise(dir, pixel_m, 330u));
+        let whitecap = smoothstep(0.45, 0.75, sea.crest) * streaks;
+        // Surf: bands of breaking foam rolling in over the last few metres of depth.
+        let shallow = 1.0 - smoothstep(0.5, 6.0, depth);
+        let rollers = smoothstep(0.55, 0.9, fract(depth * 0.4 - globals.time * 0.15 + detail_noise(dir, pixel_m, 300u)));
+        let surf = shallow * max(rollers, 1.0 - smoothstep(0.3, 1.5, depth));
+        let foam = clamp(max(whitecap, surf) * 0.85, 0.0, 1.0);
+        color = mix(color, vec3(0.92, 0.95, 0.97), foam);
         // Unresolved waves look rougher from afar.
-        roughness = mix(0.04, 0.3, smoothstep(5.0, 3000.0, pixel_m));
+        roughness = mix(mix(0.04, 0.3, smoothstep(5.0, 3000.0, pixel_m)), 0.7, foam);
         reflectance = 0.35;
     }
     if live {

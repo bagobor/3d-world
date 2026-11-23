@@ -4,6 +4,7 @@ pub mod camera;
 pub mod fauna;
 pub mod lod;
 pub mod mesh;
+pub mod ocean;
 pub mod sky;
 pub mod surface;
 pub mod vegetation;
@@ -378,6 +379,7 @@ impl Plugin for PlanetPlugin {
                     .after(vegetation::update_vegetation),
                 swap_preview_for_terrain.after(lod::update_terrain),
                 sky::adapt_atmosphere.after(camera::clamp_camera),
+                ocean::update_waves.after(camera::clamp_camera),
             ),
         );
     }
@@ -385,7 +387,7 @@ impl Plugin for PlanetPlugin {
 
 /// The terrain material, shared by every chunk.
 #[derive(Resource)]
-struct TerrainMaterialHandle(Handle<TerrainMaterial>);
+pub(crate) struct TerrainMaterialHandle(Handle<TerrainMaterial>);
 
 /// The vegetation material, shared by every vegetation tile.
 #[derive(Resource)]
@@ -701,6 +703,10 @@ pub struct PlanetMaterialParams {
     pub river_discharge: f32,
     /// 1 once the static maps exist (after generation or a cache load).
     pub show_biomes: f32,
+    /// Gerstner waves near the camera (see [`ocean`]): wave vector and amplitude.
+    pub waves: [Vec4; ocean::WAVE_COUNT],
+    /// Each wave's phase at the camera, four per vector.
+    pub wave_phases: [Vec4; 2],
 }
 
 impl Material for PlanetMaterial {
@@ -915,6 +921,8 @@ fn spawn_planet(
             resolution: graph.resolution as f32,
             river_discharge: 0.1,
             show_biomes: 1.0,
+            waves: [Vec4::ZERO; ocean::WAVE_COUNT],
+            wave_phases: [Vec4::ZERO; 2],
         },
     });
     commands.insert_resource(TerrainMaterialHandle(terrain));
@@ -934,6 +942,8 @@ fn spawn_planet(
             resolution: graph.resolution as f32,
             river_discharge: 0.1,
             show_biomes: 0.0,
+            waves: [Vec4::ZERO; ocean::WAVE_COUNT],
+            wave_phases: [Vec4::ZERO; 2],
         },
     });
     commands.spawn((

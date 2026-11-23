@@ -22,6 +22,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|
 | ![peaks](docs/peaks.png) | ![canyon](docs/canyon.png) |
 
+| open sea | surf on the coast |
+|---|---|
+| ![sea](docs/sea.png) | ![coast](docs/coast.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -91,12 +95,13 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves ten views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves twelve views, `planet.png` (whole planet),
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
 view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
 nearest grassland), `fly.png` (fly mode, 600 m up), `walk.png` (walk mode, eye height) and
 `herd.png` (next to the nearest herd), `peaks.png` (the highest summit outside the polar
-caps, from 25 km) and `canyon.png` (down in the deepest canyon in view), each once its terrain and vegetation have streamed in
+caps, from 25 km) `canyon.png` (down in the deepest canyon in view), `sea.png` (7 m above open sea) and
+`coast.png` (in the shallows, looking at a beach), each once its terrain and vegetation have streamed in
 (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
@@ -287,9 +292,18 @@ is baked, the baked fields are copied to the CPU and the planet is drawn as LOD 
   The aerial-perspective range grows with the distance to the horizon. The camera renders in
   HDR with physical units (100 klx sun, `Exposure::SUNLIGHT`), and the atmosphere also
   provides the environment light, so shadows are sky-blue and the ocean reflects the sky.
-- **Ocean**: colour by depth (green shallows, deep blue offshore), surf where it is under a
-  few metres deep, and moving wave normals from a few noise octaves. Octaves smaller than a
-  few pixels fade out and turn into roughness, so the sun glint widens with distance.
+- **Ocean**: colour by depth (green shallows, deep blue offshore). Near the camera the sea
+  surface moves with eight Gerstner waves (`planet/ocean.rs`): a 120 m swell along the
+  prevailing wind (trade winds, westerlies, polar easterlies by latitude) and shorter waves
+  spread around it, with deep-water dispersion. Their phases at the camera are computed in
+  f64 each frame and the shader adds only camera-relative offsets, so 6 m waves stay exact
+  6 400 km from the planet centre. Vertices move only where the mesh can carry a wave;
+  further out the same waves tilt the normals, then noise ripples, then roughness. Seas get
+  up to 3.7× higher under heavy cloud, waves flatten in the last few metres to the shore,
+  crests pinch into streaky whitecaps in rough seas, and rolling bands of surf break in the
+  shallows. Wave normals that would mirror the sky below the horizon are tilted back, so
+  grazing views don't reflect the atmosphere's ground colour. Offshore, terrain detail is
+  kept below the sea surface (no stray sand flats in open water).
 - **Clouds**: a shell 6 km up with procedural cover (`cloud_field.wesl`): warped fractal noise
   shaped by latitude bands (wet equator, clear subtropics, stormy mid-latitudes) and the
   baked moisture map, drifting slowly. It is not a weather simulation. The terrain shader

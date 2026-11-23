@@ -206,8 +206,12 @@ impl PlanetSurface {
     /// `min_wavelength_m` (pass about twice the mesh spacing, so LOD levels don't alias).
     pub fn height(&self, dir: DVec3, min_wavelength_m: f64) -> f64 {
         let base = self.height.sample(dir);
-        base + self.detail(dir, base, min_wavelength_m)
-            - self.canyon_depth_at(dir, base, min_wavelength_m)
+        let mut detail = self.detail(dir, base, min_wavelength_m);
+        // Offshore, detail must not raise the seabed through the sea surface (it would show
+        // as scattered sand flats); near the coast islands and shoals are fine.
+        let offshore = smoothstep(-20.0, -60.0, base);
+        detail -= offshore * (detail - detail.min(-0.8 * base)).max(0.0);
+        base + detail - self.canyon_depth_at(dir, base, min_wavelength_m)
     }
 
     /// How deep canyons cut into the surface at `dir`, in metres (0 outside canyons).
@@ -426,6 +430,24 @@ mod tests {
             deepest = deepest.max(d);
         }
         assert!(deepest > 1_000.0, "deepest canyon {deepest}");
+    }
+
+    /// Offshore, the detail never lifts the seabed above the sea.
+    #[test]
+    fn open_sea_has_no_islands() {
+        let res = 8u32;
+        let n = (res * res * 6) as usize;
+        let surface = PlanetSurface {
+            radius_m: 6_371_000.0,
+            height: CubeField::new(res, vec![-150.0; n]),
+            detail: DetailParams::default(),
+            precipitation: None,
+        };
+        for i in 0..5_000 {
+            let t = i as f64 * 0.0137;
+            let dir = DVec3::new(t.sin(), 0.3 * (t * 0.7).cos(), t.cos()).normalize();
+            assert!(surface.height(dir, 5.0) < 0.0);
+        }
     }
 
     #[test]
