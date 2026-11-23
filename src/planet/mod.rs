@@ -26,7 +26,7 @@ use crate::sim::{
 };
 use camera::{PlanetAnchor, PlanetCamera};
 use lod::{LodSettings, TerrainLod};
-use surface::{CubeField, DetailParams, PlanetSurface};
+use surface::{CubeField, DetailParams, PlanetSurface, precipitation_field};
 use vegetation::{Vegetation, VegetationMaps, VegetationMaterial, VegetationParams};
 
 /// Terrain height in metres above the sea-level datum.
@@ -421,6 +421,13 @@ fn load_terrain_surface(
             seed: control.seed,
             ..default()
         },
+        precipitation: baked.f32_field(MOISTURE).map(|moisture| {
+            precipitation_field(
+                baked.resolution,
+                &moisture,
+                EnvParams::default().subtropic_dryness as f64,
+            )
+        }),
     };
     info!("terrain: new planet surface (seed {})", baked.seed);
     lod.set_surface(&mut commands, surface, material.0.clone());

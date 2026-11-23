@@ -93,6 +93,25 @@ impl CubeField {
     }
 }
 
+/// Precipitation from the baked moisture map: the CPU twin of `precipitation` in
+/// `env_params.wesl` (moisture, dried out in the subtropical belts).
+pub fn precipitation_field(res: u32, moisture: &[f32], subtropic_dryness: f64) -> CubeField {
+    let mut data = moisture.to_vec();
+    for face in 0..6 {
+        for y in 0..res {
+            for x in 0..res {
+                let st = (DVec2::new(x as f64, y as f64) + 0.5) / res as f64 * 2.0 - 1.0;
+                let dir = face_st_to_dir(face, st);
+                let lat_deg = dir.y.clamp(-1.0, 1.0).asin().abs().to_degrees();
+                let belt = (-((lat_deg - 27.0) / 9.0).powi(2)).exp();
+                let i = ((face as u32 * res + y) * res + x) as usize;
+                data[i] = (moisture[i] as f64 * (1.0 - subtropic_dryness * belt)) as f32;
+            }
+        }
+    }
+    CubeField::new(res, data)
+}
+
 fn catmull_rom(t: f64) -> [f64; 4] {
     let t2 = t * t;
     let t3 = t2 * t;
@@ -113,9 +132,50 @@ pub struct DetailParams {
     pub amplitude_m: f64,
     /// Amplitude ratio between successive octaves (each half the wavelength).
     pub persistence: f64,
-    /// Detail amplitude in flat lowlands, relative to mountains.
+    /// Detail amplitude in flat lowlands, relative to uplands.
     pub lowland_roughness: f64,
+    /// Extra detail amplitude in high mountains, relative to uplands.
+    pub mountain_relief: f64,
     pub seed: u32,
+    /// Canyons cut into dry plateaus (needs [`PlanetSurface::precipitation`]).
+    pub canyons: CanyonParams,
+}
+
+/// Canyon networks: deep channels with stepped walls, carved into dry plateaus. They are
+/// part of the deterministic terrain surface (like the detail octaves), driven by the baked
+/// precipitation and height maps; nothing about them is simulated at runtime.
+#[derive(Clone, Copy, Debug)]
+pub struct CanyonParams {
+    /// Spacing of the main canyons, in metres.
+    pub trunk_wavelength_m: f64,
+    /// Half-width of a main canyon at the rim, in metres.
+    pub trunk_half_width_m: f64,
+    /// Depth of a main canyon, in metres.
+    pub trunk_depth_m: f64,
+    /// Spacing, half-width and depth of the side canyons.
+    pub branch_wavelength_m: f64,
+    pub branch_half_width_m: f64,
+    pub branch_depth_m: f64,
+    /// Number of cliff-and-bench steps in the walls.
+    pub terraces: f64,
+    /// Precipitation (see `precipitation` in `env_params.wesl`) below which plateaus are dry
+    /// enough for canyons; they fade out between this and twice this.
+    pub dry_precipitation: f64,
+}
+
+impl Default for CanyonParams {
+    fn default() -> Self {
+        Self {
+            trunk_wavelength_m: 90_000.0,
+            trunk_half_width_m: 2_600.0,
+            trunk_depth_m: 1_300.0,
+            branch_wavelength_m: 24_000.0,
+            branch_half_width_m: 900.0,
+            branch_depth_m: 550.0,
+            terraces: 5.0,
+            dry_precipitation: 0.16,
+        }
+    }
 }
 
 impl Default for DetailParams {
@@ -125,7 +185,9 @@ impl Default for DetailParams {
             amplitude_m: 700.0,
             persistence: 0.56,
             lowland_roughness: 0.35,
+            mountain_relief: 1.8,
             seed: 0,
+            canyons: CanyonParams::default(),
         }
     }
 }
@@ -135,6 +197,8 @@ pub struct PlanetSurface {
     pub radius_m: f64,
     pub height: CubeField,
     pub detail: DetailParams,
+    /// Baked precipitation (moisture with the subtropical dry belt applied); canyons need it.
+    pub precipitation: Option<CubeField>,
 }
 
 impl PlanetSurface {
@@ -143,12 +207,96 @@ impl PlanetSurface {
     pub fn height(&self, dir: DVec3, min_wavelength_m: f64) -> f64 {
         let base = self.height.sample(dir);
         base + self.detail(dir, base, min_wavelength_m)
+            - self.canyon_depth_at(dir, base, min_wavelength_m)
+    }
+
+    /// How deep canyons cut into the surface at `dir`, in metres (0 outside canyons).
+    pub fn canyon_depth(&self, dir: DVec3, min_wavelength_m: f64) -> f64 {
+        self.canyon_depth_at(dir, self.height.sample(dir), min_wavelength_m)
+    }
+
+    fn canyon_depth_at(&self, dir: DVec3, base: f64, min_wavelength_m: f64) -> f64 {
+        let Some(precipitation) = &self.precipitation else {
+            return 0.0;
+        };
+        let c = &self.detail.canyons;
+        // Only where a mesh can resolve the walls; distant LOD levels stay smooth.
+        let resolve = smoothstep(
+            4.0 * c.branch_half_width_m,
+            1.5 * c.branch_half_width_m,
+            min_wavelength_m,
+        )
+        .max(smoothstep(
+            4.0 * c.trunk_half_width_m,
+            1.5 * c.trunk_half_width_m,
+            min_wavelength_m,
+        ));
+        // Dry plateaus well above the sea, below the high mountains.
+        let plateau = smoothstep(250.0, 700.0, base) * (1.0 - smoothstep(3000.0, 4200.0, base));
+        if resolve <= 0.0 || plateau <= 0.0 {
+            return 0.0;
+        }
+        let dry = smoothstep(
+            2.0 * c.dry_precipitation,
+            c.dry_precipitation,
+            precipitation.sample(dir),
+        );
+        if dry <= 0.0 {
+            return 0.0;
+        }
+        let seed = self.detail.seed.wrapping_add(7_000);
+        let p = dir * self.radius_m;
+        // Canyon country comes in regions, not everywhere that is dry.
+        let region = smoothstep(-0.15, 0.2, gradient_noise(p / 700_000.0, seed));
+        let mask = dry * plateau * region * resolve;
+        if mask <= 0.0 {
+            return 0.0;
+        }
+        // Meandering channels: the zero set of warped noise. |noise| / gradient approximates
+        // the distance to the channel's centre line.
+        let warp_wl = 0.35 * c.trunk_wavelength_m;
+        let warp = DVec3::new(
+            gradient_noise(p / warp_wl, seed + 1),
+            gradient_noise(p / warp_wl, seed + 2),
+            gradient_noise(p / warp_wl, seed + 3),
+        ) * (0.12 * c.trunk_wavelength_m);
+        let q = p + warp;
+        // Distance from a channel's centre line, in metres.
+        let distance = |wavelength: f64, seed: u32| {
+            gradient_noise(q / wavelength, seed).abs() * wavelength / 2.5
+        };
+        // Cross-section: 0 at the rim .. 1 on the floor, which is about a third of the width.
+        let profile = |distance: f64, half_width: f64| {
+            terrace(
+                smoothstep(half_width, 0.3 * half_width, distance),
+                c.terraces,
+            )
+        };
+        let trunk_distance = distance(c.trunk_wavelength_m, seed + 4);
+        let trunk = c.trunk_depth_m * profile(trunk_distance, c.trunk_half_width_m);
+        // Side canyons are shallower, and only branch off near a main canyon.
+        let near_trunk = smoothstep(
+            10.0 * c.trunk_half_width_m,
+            2.0 * c.trunk_half_width_m,
+            trunk_distance,
+        );
+        let branch = near_trunk
+            * c.branch_depth_m
+            * profile(
+                distance(c.branch_wavelength_m, seed + 5),
+                c.branch_half_width_m,
+            );
+        // Never cut below the sea.
+        (mask * trunk.max(branch)).min((base - 60.0).max(0.0))
     }
 
     fn detail(&self, dir: DVec3, base: f64, min_wavelength_m: f64) -> f64 {
         let d = &self.detail;
-        let rough =
-            d.lowland_roughness + (1.0 - d.lowland_roughness) * smoothstep(150.0, 2000.0, base);
+        // Rolling lowlands, rough uplands, and high mountains with much more relief, so the
+        // broad baked highlands (one texel is ~20 km) break up into peaks and valleys.
+        let rough = d.lowland_roughness
+            + (1.0 - d.lowland_roughness) * smoothstep(150.0, 2000.0, base)
+            + d.mountain_relief * smoothstep(1500.0, 4000.0, base);
         let p = dir * self.radius_m;
         let mut wavelength = d.base_wavelength_m;
         let mut amp = d.amplitude_m * rough;
@@ -158,8 +306,10 @@ impl PlanetSurface {
             // Fade the finest octave in, so a LOD switch doesn't pop.
             let fade = ((wavelength / min_wavelength_m - 1.0) * 2.0).clamp(0.0, 1.0);
             let n = gradient_noise(p / wavelength, d.seed.wrapping_add(octave * 131));
-            // Mountains get sharper, ridged detail; lowlands stay rolling.
-            let ridged = (1.0 - 2.0 * n.abs()) * 0.8;
+            // Mountains get sharp ridged crests (squared, so crests are narrow and valleys
+            // broad); lowlands stay rolling.
+            let r = 1.0 - n.abs();
+            let ridged = 1.8 * r * r - 0.9;
             let n = n + (ridged - n) * smoothstep(800.0, 3000.0, base);
             sum += amp * fade * n;
             wavelength *= 0.5;
@@ -168,6 +318,13 @@ impl PlanetSurface {
         }
         sum
     }
+}
+
+/// Steps `s` (0..1) into `steps` flat benches joined by steep cliffs.
+fn terrace(s: f64, steps: f64) -> f64 {
+    let x = s * steps;
+    let i = x.floor();
+    ((i + smoothstep(0.65, 1.0, x - i)) / steps).min(1.0)
 }
 
 pub fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
@@ -243,6 +400,32 @@ mod tests {
             worst = worst.max((field.sample(dir) - f(dir)).abs());
         }
         assert!(worst < 2.0, "max error {worst}");
+    }
+
+    /// Dry plateaus get canyons that are deep but never reach the sea; wet ones get none.
+    #[test]
+    fn canyons_cut_dry_plateaus_only() {
+        let res = 8u32;
+        let n = (res * res * 6) as usize;
+        let surface = |precipitation: f32| PlanetSurface {
+            radius_m: 6_371_000.0,
+            height: CubeField::new(res, vec![1_500.0; n]),
+            detail: DetailParams::default(),
+            precipitation: Some(CubeField::new(res, vec![precipitation; n])),
+        };
+        let (dry, wet) = (surface(0.02), surface(0.8));
+        let mut deepest: f64 = 0.0;
+        for i in 0..20_000 {
+            let t = i as f64 * 0.0137;
+            let dir = DVec3::new(t.sin(), 0.3 + 0.1 * (t * 0.7).cos(), t.cos()).normalize();
+            let d = dry.canyon_depth(dir, 50.0);
+            assert!((0.0..=1_440.0).contains(&d), "depth {d}");
+            assert_eq!(wet.canyon_depth(dir, 50.0), 0.0);
+            // Too coarse a mesh to resolve the walls: no canyon.
+            assert_eq!(dry.canyon_depth(dir, 50_000.0), 0.0);
+            deepest = deepest.max(d);
+        }
+        assert!(deepest > 1_000.0, "deepest canyon {deepest}");
     }
 
     #[test]

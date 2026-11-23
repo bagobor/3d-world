@@ -874,6 +874,7 @@ mod tests {
             radius_m: 6_371_000.0,
             height: CubeField::new(res, vec![100.0; n]),
             detail: DetailParams::default(),
+            precipitation: None,
         };
         let biome = vec![Biome::TemperateForest as u32 as f32; n];
         (surface, VegetationMaps::new(res, &biome, vec![12.0; n]))
