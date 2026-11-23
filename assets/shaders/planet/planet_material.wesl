@@ -206,11 +206,60 @@ fn biome_color(dir: vec3<f32>, h: f32, slope: f32, pixel_m: f32) -> vec3<f32> {
     c = mix(c, shrub, clamp(plants.g, 0.0, 1.0));
     c = mix(c, tree, clamp(plants.b, 0.0, 1.0));
     c *= 0.9 + 1.0 * n_ground;
-    // Beaches, bare rock on steep slopes, snow where it is cold enough.
+    // Beaches, then bare rock on steep slopes: layered red sandstone in dry country (canyon
+    // walls), grey rock elsewhere.
     c = mix(vec3(0.76, 0.70, 0.50), c, smoothstep(2.0, 30.0, h));
-    c = mix(c, vec3(0.35, 0.30, 0.27), smoothstep(0.35, 0.6, slope));
-    let snow = smoothstep(-3.0, -9.0, sample_field(TEMPERATURE, dir)) * (1.0 - smoothstep(0.5, 0.8, slope));
-    return mix(c, vec3(0.92, 0.94, 0.97), snow);
+    // Sandstone only in warm dry country, not on cold dry mountains.
+    let warm_rock = smoothstep(-2.0, 6.0, local_temperature(dir, h));
+    let dry = warm_rock * smoothstep(0.32, 0.16, precipitation(sample_field(MOISTURE, dir), dir));
+    let rock = mix(vec3(0.35, 0.30, 0.27), strata_color(dir, h, pixel_m), dry);
+    c = mix(c, rock, smoothstep(0.35, 0.6, slope));
+    return mix(c, vec3(0.92, 0.94, 0.97), snow_cover(dir, h, slope, pixel_m));
+}
+
+// Mirrors `EnvParams::lapse_rate_c_per_m` and `subtropic_dryness`.
+const LAPSE_RATE_C_PER_M: f32 = 0.0065;
+const SUBTROPIC_DRYNESS: f32 = 0.6;
+
+// Same as `precipitation` in `env_params.wesl`: moisture, dried out in the subtropics.
+fn precipitation(moisture: f32, dir: vec3<f32>) -> f32 {
+    let lat_deg = abs(asin(clamp(dir.y, -1.0, 1.0))) * 57.29578;
+    let belt = exp(-pow((lat_deg - 27.0) / 9.0, 2.0));
+    return moisture * (1.0 - SUBTROPIC_DRYNESS * belt);
+}
+
+// 0..1 snow on the ground. The baked temperature is for the ~20 km texel's mean height, so
+// it is corrected by the lapse rate to the actual height: peaks above the snow line are
+// white even where the texel around them is not. Noise makes the snow line ragged, and
+// cliffs too steep to hold snow stay bare unless it is very cold (ice caps, glaciers).
+fn local_temperature(dir: vec3<f32>, h: f32) -> f32 {
+    let field_h = max(sample_field(HEIGHT, dir), 0.0);
+    return sample_field(TEMPERATURE, dir) - LAPSE_RATE_C_PER_M * (h - field_h);
+}
+
+fn snow_cover(dir: vec3<f32>, h: f32, slope: f32, pixel_m: f32) -> f32 {
+    let t = local_temperature(dir, h);
+    let ragged = t + 4.0 * detail_noise(dir, pixel_m, 700u);
+    let cold = smoothstep(-1.0, -5.0, ragged);
+    let holds = 1.0 - smoothstep(0.4, 0.75, slope);
+    let glacier = smoothstep(-10.0, -16.0, ragged);
+    return clamp(max(cold * holds, glacier * (1.0 - smoothstep(0.9, 1.4, slope))), 0.0, 1.0);
+}
+
+// Sedimentary layers: bands a few tens of metres thick in reds, ochres and creams,
+// slightly wavy so they don't look ruled.
+fn strata_color(dir: vec3<f32>, h: f32, pixel_m: f32) -> vec3<f32> {
+    let y = h / 35.0 + 3.0 * detail_noise(dir, pixel_m, 811u);
+    let band = floor(y);
+    let k = fract(sin(band * 12.9898) * 43758.547);
+    let red = vec3(0.55, 0.24, 0.13);
+    let ochre = vec3(0.70, 0.45, 0.24);
+    let cream = vec3(0.78, 0.68, 0.52);
+    var c = mix(red, ochre, smoothstep(0.2, 0.6, k));
+    c = mix(c, cream, smoothstep(0.75, 0.95, k));
+    // Soft edges between bands, darker toward each band's base; the average from afar.
+    c *= 0.8 + 0.2 * smoothstep(0.0, 0.4, fract(y));
+    return mix(vec3(0.6, 0.38, 0.22), c, smoothstep(40.0, 10.0, pixel_m));
 }
 
 // Placeholder colours while the planet is still generating (no biome maps yet).

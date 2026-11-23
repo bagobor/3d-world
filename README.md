@@ -18,6 +18,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 
 ![herd](docs/herd.png)
 
+| snow-capped peaks | canyon country |
+|---|---|
+| ![peaks](docs/peaks.png) | ![canyon](docs/canyon.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -87,11 +91,12 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves eight views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves ten views, `planet.png` (whole planet),
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
 view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
 nearest grassland), `fly.png` (fly mode, 600 m up), `walk.png` (walk mode, eye height) and
-`herd.png` (next to the nearest herd), each once its terrain and vegetation have streamed in
+`herd.png` (next to the nearest herd), `peaks.png` (the highest summit outside the polar
+caps, from 25 km) and `canyon.png` (down in the deepest canyon in view), each once its terrain and vegetation have streamed in
 (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
@@ -247,8 +252,21 @@ While the planet generates, a GPU-displaced sphere previews the live height fiel
 is baked, the baked fields are copied to the CPU and the planet is drawn as LOD terrain:
 
 - **Surface** (`surface.rs`): the baked height (~20 km texels, sampled bicubically across
-  cube edges) plus fractal detail from 40 km down to the mesh spacing, rougher and ridged in
-  mountains, gentler in lowlands. Everything is f64.
+  cube edges) plus fractal detail from 40 km down to the mesh spacing: gentle in lowlands,
+  rougher in uplands, and in high mountains nearly three times rougher with sharp ridged
+  crests, so the broad baked highlands break up into peaks and valleys. Everything is f64.
+- **Canyons** (`surface.rs`, `CanyonParams`): branching canyon networks cut into dry
+  plateaus (250 m to 4 km up, low baked precipitation, in regions picked by large-scale
+  noise). Main canyons are the warped zero lines of a 90 km noise, about 5 km wide and
+  1.3 km deep; side canyons (24 km noise, 550 m deep) branch off near them. Walls are
+  stepped into five cliff-and-bench terraces, and canyons never cut below sea level. They are
+  part of the deterministic surface, from the baked maps, and only appear on mesh levels
+  fine enough to resolve their walls.
+- **Snow and rock**: snow follows the baked temperature corrected by the lapse rate to the
+  actual height, so peaks above the snow line are white even inside a warmer 20 km texel;
+  the snow line is ragged, and cliffs too steep to hold snow stay bare except on ice caps.
+  Steep rock in warm, dry country is layered sandstone (red, ochre and cream bands a few tens
+  of metres thick), grey rock elsewhere.
 - **Quadtree** (`lod.rs`): each cube face is a quadtree of 32×32-quad chunks, up to level 19
   (~0.3 m between vertices). A chunk splits when the camera is nearer than 2.4 edge lengths;
   chunks wholly behind the horizon are skipped. Chunks are built on the async compute pool,

@@ -122,7 +122,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd] [--no-shadows]"
+                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon] [--no-shadows]"
                     );
                     std::process::exit(0);
                 }
@@ -532,6 +532,77 @@ fn shots(
     walk.pitch = 0.02;
     walk.altitude_m = surface.height(target, 1.0).max(0.0) + camera::WALK_EYE_HEIGHT_M;
     walk.mode = camera::CameraMode::Walk;
+    // Snow-capped peaks: the highest summit in view, seen from 25 km away, below it.
+    let ring_points = || {
+        (0..120).flat_map(move |ring| {
+            let count = (ring * 6).max(1);
+            (0..count).map(move |k| {
+                let a = k as f64 / count as f64 * std::f64::consts::TAU;
+                (up + (north * a.cos() + east * a.sin()) * (ring as f64 * 0.01)).normalize()
+            })
+        })
+    };
+    // The best-scoring point on a small grid around `dir`, `step` radians apart.
+    let refine = |dir: DVec3, step: f64, score: &dyn Fn(DVec3) -> f64| -> DVec3 {
+        let (n, e) = (north - dir * north.dot(dir), east - dir * east.dot(dir));
+        let mut best = (score(dir), dir);
+        for i in -10..=10 {
+            for j in -10..=10 {
+                let d = (dir + (n * i as f64 + e * j as f64) * step).normalize();
+                let s = score(d);
+                if s > best.0 {
+                    best = (s, d);
+                }
+            }
+        }
+        best.1
+    };
+    // Below the polar ice caps, so it is a mountain and not an ice sheet.
+    let summit_height = |d: DVec3| {
+        if d.y.abs() < 0.55 {
+            surface.height.sample(d)
+        } else {
+            f64::MIN
+        }
+    };
+    let summit = ring_points()
+        .max_by(|a, b| summit_height(*a).total_cmp(&summit_height(*b)))
+        .unwrap_or(up);
+    let summit = refine(summit, 0.0006, &|d| surface.height(d, 200.0));
+    let summit_h = surface.height(summit, 1.0);
+    let mut peaks = *start;
+    peaks.dir = summit;
+    peaks.heading = 0.7;
+    peaks.move_by(-25_000.0, 0.0);
+    peaks.altitude_m = (surface.height(peaks.dir, 1.0) + 300.0).max(summit_h - 2_500.0);
+    peaks.pitch = ((summit_h - peaks.altitude_m) / 25_000.0).atan() - 0.04;
+    // Canyon country: down in the deepest canyon in view, looking along it.
+    let canyon_dir = ring_points()
+        .find(|d| surface.canyon_depth(*d, 1.0) > 600.0)
+        .map(|d| refine(d, 0.00015, &|p| surface.canyon_depth(p, 1.0)));
+    let mut canyon = fly;
+    if let Some(floor) = canyon_dir {
+        canyon.dir = floor;
+        canyon.heading = (0..16)
+            .map(|k| k as f64 / 16.0 * std::f64::consts::TAU)
+            .max_by(|a, b| {
+                let along = |heading: f64| {
+                    let mut c = canyon;
+                    c.heading = heading;
+                    c.move_by(4_000.0, 0.0);
+                    surface.canyon_depth(c.dir, 1.0)
+                };
+                along(*a).total_cmp(&along(*b))
+            })
+            .unwrap_or(0.0);
+        canyon.move_by(-2_500.0, 0.0);
+        let rim = surface.height(canyon.dir, 1.0) + surface.canyon_depth(canyon.dir, 1.0);
+        canyon.altitude_m = rim + 150.0;
+        canyon.pitch = -0.2;
+        canyon.mode = camera::CameraMode::Fly;
+    } else {
+        warn!("headless: no canyon found in view");
+    }
     vec![
         ("planet", *start),
         ("orbit", orbit),
@@ -542,6 +613,8 @@ fn shots(
         ("walk", walk),
         // Moved next to the nearest herd once animals are about.
         ("herd", meadow),
+        ("peaks", peaks),
+        ("canyon", canyon),
     ]
 }
 

@@ -481,6 +481,7 @@ mod tests {
             radius_m: 6_371_000.0,
             height: CubeField::new(4, vec![100.0; 4 * 4 * 6]),
             detail: DetailParams::default(),
+            precipitation: None,
         }
     }
 
