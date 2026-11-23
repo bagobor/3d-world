@@ -36,6 +36,7 @@ struct PlanetMaterialParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(6) var plants_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(7) var fire_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(8) var moisture_tex: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(9) var cloud_noise_tex: texture_2d_array<f32>;
 
 fn load_field(field: u32, t: vec3<u32>) -> f32 {
     let p = vec2<i32>(t.xy);
@@ -361,7 +362,10 @@ fn shade(
         let up = max(dot(dir, sun), 0.05);
         let p = dir * (material.planet_radius_m + max(h, 0.0)) + sun * (CLOUD_HEIGHT_M - max(h, 0.0)) / up;
         let shadow_dir = normalize(p);
-        let cover = cloud_coverage(shadow_dir, sample_field(MOISTURE, shadow_dir), globals.time);
+        let cover = cloud_coverage(
+            cloud_noise_tex, material.resolution, shadow_dir,
+            sample_field(MOISTURE, shadow_dir), globals.time, false,
+        );
         color *= 1.0 - 0.6 * cover;
     }
     pbr.material.base_color = vec4(color, 1.0);

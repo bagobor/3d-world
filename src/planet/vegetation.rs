@@ -794,6 +794,9 @@ pub struct VegetationMaterial {
     pub temperature: Handle<Image>,
     #[texture(3, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub moisture: Handle<Image>,
+    /// For cloud shadows.
+    #[texture(4, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub cloud_noise: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, ShaderType)]

@@ -19,6 +19,8 @@ import super::vegetation_common::{
 };
 import super::cloud_field::cloud_coverage;
 
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var cloud_noise_tex: texture_2d_array<f32>;
+
 fn hash01(x: f32) -> f32 {
     return fract(sin(x * 91.3458) * 47453.5453);
 }
@@ -136,7 +138,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
     let dir = normalize(in.up);
     let lift = max(dot(dir, sun), 0.05);
     let shadow_dir = normalize(dir * params.planet_radius_m + sun * 6000.0 / lift);
-    let cover = cloud_coverage(shadow_dir, sample_field(MOISTURE, shadow_dir).r, globals.time);
+    let cover = cloud_coverage(
+        cloud_noise_tex, params.resolution, shadow_dir,
+        sample_field(MOISTURE, shadow_dir).r, globals.time, false,
+    );
     color *= 1.0 - 0.6 * cover;
 
     var pbr: PbrInput = pbr_input_new();

@@ -52,6 +52,8 @@ pub const FIRE: &str = "fire";
 /// Live animal populations: r grazers, g predators (density, ~1 = what the best pasture
 /// feeds), b grass and a shrub cover eaten this step.
 pub const ANIMALS: &str = "animals";
+/// The clouds' warped noise, baked once (see `shaders/planet/cloud_field.wesl`).
+pub const CLOUD_NOISE: &str = "cloud_noise";
 
 /// Bump when generation changes, so cached planets from older generators are not loaded.
 pub const GENERATOR_VERSION: &str = "planet-v1";
@@ -117,6 +119,7 @@ const PLANTS_INIT: &str = "plants_init";
 const PLANTS_GROW: &str = "plants_grow";
 const FIRE_SPREAD: &str = "fire_spread";
 const ANIMALS_INIT: &str = "animals_init";
+const CLOUD_BAKE: &str = "cloud_bake";
 const ANIMALS_STEP: &str = "animals_step";
 
 /// Mirrors `TerrainParams` in `shaders/planet/terrain_params.wesl`.
@@ -475,6 +478,7 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
         .add_field(PLANTS, FieldFormat::Rgba32Float)
         .add_field(FIRE, FieldFormat::R32Float)
         .add_field(ANIMALS, FieldFormat::Rgba32Float)
+        .add_field(CLOUD_NOISE, FieldFormat::Rgba16Float)
         // Initial state.
         .add_pass(generate(
             SimPass::new(
@@ -602,6 +606,11 @@ fn declare_simulation(mut graph: ResMut<SimGraph>) {
             .trigger(PassTrigger::OnReset)
             .with_params(animals),
         )
+        .add_pass(
+            SimPass::new(CLOUD_BAKE, "shaders/planet/cloud_bake.wesl", "cloud_bake")
+                .write(CLOUD_NOISE)
+                .trigger(PassTrigger::OnReset),
+        )
         // Animals feed first; plants_grow then takes what they ate off the cover.
         .add_pass(
             SimPass::new(
@@ -672,6 +681,8 @@ pub struct PlanetMaterial {
     pub fire: Handle<Image>,
     #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub moisture: Handle<Image>,
+    #[texture(9, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub cloud_noise: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -731,6 +742,8 @@ pub struct TerrainMaterial {
     pub fire: Handle<Image>,
     #[texture(8, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub moisture: Handle<Image>,
+    #[texture(9, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub cloud_noise: Handle<Image>,
 }
 
 impl Material for TerrainMaterial {
@@ -781,6 +794,8 @@ pub struct CloudMaterial {
     pub params: CloudParams,
     #[texture(1, dimension = "2d_array", sample_type = "float", filterable = false)]
     pub moisture: Handle<Image>,
+    #[texture(2, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub cloud_noise: Handle<Image>,
 }
 
 #[derive(Clone, Copy, Debug, bevy::render::render_resource::ShaderType)]
@@ -855,6 +870,7 @@ fn spawn_planet(
         plants: fields.front(PLANTS),
         temperature: fields.front(TEMPERATURE),
         moisture: fields.front(MOISTURE),
+        cloud_noise: fields.front(CLOUD_NOISE),
     });
     commands.insert_resource(VegetationMaterialHandle(vegetation));
     let clouds = cloud_materials.add(CloudMaterial {
@@ -865,6 +881,7 @@ fn spawn_planet(
             visible: 0.0,
         },
         moisture: fields.front(MOISTURE),
+        cloud_noise: fields.front(CLOUD_NOISE),
     });
     commands.spawn((
         Name::new("Clouds"),
@@ -884,6 +901,7 @@ fn spawn_planet(
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
         moisture: fields.front(MOISTURE),
+        cloud_noise: fields.front(CLOUD_NOISE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: 1.0,
@@ -902,6 +920,7 @@ fn spawn_planet(
         plants: fields.front(PLANTS),
         fire: fields.front(FIRE),
         moisture: fields.front(MOISTURE),
+        cloud_noise: fields.front(CLOUD_NOISE),
         params: PlanetMaterialParams {
             planet_radius_m: TerrainParams::default().planet_radius_m,
             height_exaggeration: config.height_exaggeration,
