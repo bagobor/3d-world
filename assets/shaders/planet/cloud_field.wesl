@@ -16,7 +16,10 @@ fn cloud_fbm(p: vec3<f32>, octaves: u32) -> f32 {
     return sum;
 }
 
-fn cloud_coverage(dir_in: vec3<f32>, moisture: f32, time: f32) -> f32 {
+// Raw cloud density before it is mapped to coverage: above ~0.32 the sky is overcast, and
+// the higher it goes the thicker the cloud (rain, then storms). Mirrored on the CPU by
+// `cloud_density` in src/planet/weather.rs.
+fn cloud_density(dir_in: vec3<f32>, moisture: f32, time: f32) -> f32 {
     // Drift: rotate the pattern slowly about the planet's axis.
     let a = time * 0.0004;
     let dir = vec3(dir_in.x * cos(a) - dir_in.z * sin(a), dir_in.y, dir_in.x * sin(a) + dir_in.z * cos(a));
@@ -28,6 +31,22 @@ fn cloud_coverage(dir_in: vec3<f32>, moisture: f32, time: f32) -> f32 {
     let p = dir * 5.0;
     let warp = vec3(cloud_fbm(p + 11.0, 3), cloud_fbm(p + 23.0, 3), cloud_fbm(p + 37.0, 3));
     let n = cloud_fbm(p * 1.6 + warp * 1.4, 7);
-    let v = n + band + (moisture - 0.6) * 0.35;
+    return n + band + (moisture - 0.6) * 0.35;
+}
+
+fn coverage_from_density(v: f32) -> f32 {
     return smoothstep(0.02, 0.32, v);
+}
+
+// Rain falls from the thickest cloud, storms from the thickest of that.
+fn rain_from_density(v: f32) -> f32 {
+    return smoothstep(0.22, 0.38, v);
+}
+
+fn storm_from_density(v: f32) -> f32 {
+    return smoothstep(0.38, 0.55, v);
+}
+
+fn cloud_coverage(dir_in: vec3<f32>, moisture: f32, time: f32) -> f32 {
+    return coverage_from_density(cloud_density(dir_in, moisture, time));
 }

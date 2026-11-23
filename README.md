@@ -26,6 +26,10 @@ compute: each simulation subsystem is a set of compute passes over planet-wide f
 |---|---|
 | ![sea](docs/sea.png) | ![coast](docs/coast.png) |
 
+| rain | snowfall | storm |
+|---|---|---|
+| ![rain](docs/rain.png) | ![snowfall](docs/snowfall.png) | ![storm](docs/storm.png) |
+
 ## Status
 
 - Step 1: the app skeleton and a reusable GPU simulation framework, with a procedural
@@ -95,13 +99,15 @@ The first start with a given seed and resolution generates the planet
 (about 36 MiB at 512²). Later starts load that file in well under a second. `--no-cache`
 turns the cache off, `--cache DIR` moves it.
 
-Headless mode renders offscreen and saves twelve views, `planet.png` (whole planet),
+Headless mode renders offscreen and saves fifteen views, `planet.png` (whole planet),
 `orbit.png` (low orbit), `surface.png` (40 m above hilly land near the middle of the first
 view), `forest.png` (45 m over the nearest forest), `meadow.png` (eye height in the
 nearest grassland), `fly.png` (fly mode, 600 m up), `walk.png` (walk mode, eye height) and
 `herd.png` (next to the nearest herd), `peaks.png` (the highest summit outside the polar
 caps, from 25 km) `canyon.png` (down in the deepest canyon in view), `sea.png` (7 m above open sea) and
-`coast.png` (in the shallows, looking at a beach), each once its terrain and vegetation have streamed in
+`coast.png` (in the shallows, looking at a beach), and `rain.png`, `snowfall.png` and
+`storm.png` (placed, when their turn comes, where the weather is doing that in daylight;
+the clock stops until the shot is taken because clouds drift fast), each once its terrain and vegetation have streamed in
 (`--views forest,meadow` picks some), plus `stats.txt` (min/max/mean of every
 field and plant layer, and the share of each biome), and exits. `--steps N` runs N
 live steps first. It works on a software Vulkan
@@ -309,6 +315,26 @@ is baked, the baked fields are copied to the CPU and the planet is drawn as LOD 
   baked moisture map, drifting slowly. It is not a weather simulation. The terrain shader
   evaluates the same function where the ray to the sun crosses the cloud layer, which gives
   cloud shadows.
+
+
+### Weather
+
+No weather simulation (no climate, no seasons): the drifting procedural cloud field
+already says where it is cloudy, and weather follows its density (`planet/weather.rs`,
+which mirrors `cloud_field.wesl` on the CPU to know the weather at the camera).
+
+- **Where**: overcast above a density of ~0.3; rain from the thickest ~12% of the planet;
+  storms from the thickest ~3%. Rain falls as snow where the baked temperature, corrected
+  to the camera's height by the lapse rate, is below freezing.
+- **Rain and snow** (`precipitation.wesl`): 24 000 particles in a box around the camera,
+  drifting with the wind (prevailing winds by latitude, stronger in storms) and against the
+  camera's own motion, wrapping around so the box never shows. Rain draws as motion-blurred
+  streaks, snow as fluttering flakes; both are lit, so they dim at night.
+- **Haze**: the camera's distance fog thickens from ~60 km visibility to ~3 km in heavy rain
+  and ~1 km in snow (the terrain and plant shaders apply it too).
+- **Storms**: darker, thicker clouds, a dimmer sun, much rougher seas, and lightning:
+  random flashes inside storm clouds (visible from orbit on the night side) and, under a
+  storm, double-flicker flashes that light the whole scene.
 
 ### Vegetation
 

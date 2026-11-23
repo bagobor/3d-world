@@ -37,6 +37,7 @@ use planet_sim::{
         fauna::{Fauna, Species},
         lod::{LodSettings, TerrainLod},
         vegetation::Vegetation,
+        weather::Weather,
     },
     sim::{
         self, GpuSimPlugin, SimControl, SimFields, SimStats,
@@ -122,7 +123,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon,sea,coast] [--no-shadows]"
+                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon,sea,coast,rain,snowfall,storm] [--no-shadows]"
                     );
                     std::process::exit(0);
                 }
@@ -200,6 +201,9 @@ fn main() -> AppExit {
     .run()
 }
 
+/// Towards the sun (it stays put; the planet doesn't turn).
+const SUN_DIRECTION: Vec3 = Vec3::new(4.0, 1.5, 2.0);
+
 /// Headless render target, captured by `headless_capture`.
 #[derive(Resource)]
 struct CaptureTarget(Handle<Image>);
@@ -211,6 +215,7 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
             shadow_maps_enabled: args.shadows,
             ..default()
         },
+        planet::weather::Sun,
         // Shadows from a blade's length to the hills a few km away: the first cascade is
         // small for animals and shrubs, the last reaches mountain shadows.
         bevy::light::CascadeShadowConfigBuilder {
@@ -221,12 +226,12 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
             overlap_proportion: 0.2,
         }
         .build(),
-        Transform::from_xyz(4.0, 1.5, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(SUN_DIRECTION).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     // Physical units: full sunlight and a daylight exposure. Skylight comes from the
     // atmosphere's environment map; a little ambient keeps the night side from going black.
     commands.insert_resource(GlobalAmbientLight {
-        brightness: 300.0,
+        brightness: planet::weather::AMBIENT_BRIGHTNESS,
         ..default()
     });
 
@@ -237,6 +242,8 @@ fn setup_scene(mut commands: Commands, args: Res<Args>, mut images: ResMut<Asset
         bevy::camera::Exposure::SUNLIGHT,
         bevy::pbr::AtmosphereSettings::default(),
         bevy::light::AtmosphereEnvironmentMapLight::default(),
+        // Rain and snow haze (see `planet::weather`); invisible in clear weather.
+        planet::weather::rain_and_haze_fog(),
         Projection::Perspective(PerspectiveProjection {
             near: 0.3,
             far: 1.0e9,
@@ -344,6 +351,7 @@ fn headless_capture(
     mut wait: Local<u32>,
     done: Option<ResMut<CaptureDone>>,
     mut exit: MessageWriter<AppExit>,
+    (weather, mut virtual_time): (Res<Weather>, ResMut<Time<Virtual>>),
 ) {
     *frames += 1;
     let Some(mut done) = done else {
@@ -426,16 +434,41 @@ fn headless_capture(
         }
         return;
     }
+    if WEATHER_VIEWS.contains(&name) && done.weather_placed != Some(done.taken) {
+        // Clouds drift fast (a time-lapse), so find the weather now and stop the clock until
+        // the view is taken; the first camera move streams the terrain in anyway.
+        virtual_time.pause();
+        let t = virtual_time.elapsed_secs_wrapped() as f64;
+        let surface = lod.surface().unwrap();
+        let found = weather_spot(name, &weather, surface, t);
+        let taken = done.taken;
+        let shot = &mut done.shots[taken].1;
+        match found {
+            Some(dir) => {
+                shot.dir = dir;
+                shot.altitude_m = surface.height(dir, 1.0).max(0.0) + 25.0;
+            }
+            None => warn!("headless: no {name} found on the planet"),
+        }
+        *camera = *shot;
+        done.weather_placed = Some(taken);
+        *wait = 0;
+        return;
+    }
     if done.retake {
         done.retake = false;
         take_screenshot(&mut commands, &target, &args, name);
     } else if !done.shooting && *wait > 5 && lod.settled() && vegetation.settled() && fauna_ready {
         info!(
-            "headless: {name} view, {} chunks, {} vegetation tiles, {} grazers, {} predators",
+            "headless: {name} view, {} chunks, {} vegetation tiles, {} grazers, {} predators, \
+             precipitation {:.2}{}, storm {:.2}",
             lod.drawn(),
             vegetation.drawn(),
             fauna.count(Species::Grazer),
             fauna.count(Species::Predator),
+            weather.precipitation,
+            if weather.snow { " (snow)" } else { "" },
+            weather.storm,
         );
         done.shooting = true;
         take_screenshot(&mut commands, &target, &args, name);
@@ -446,6 +479,9 @@ fn headless_capture(
         exit.write(AppExit::error());
     }
     if done.shooting && done.screenshot_saved {
+        if WEATHER_VIEWS.contains(&name) {
+            virtual_time.unpause();
+        }
         done.shooting = false;
         done.screenshot_saved = false;
         done.taken += 1;
@@ -649,7 +685,60 @@ fn shots(
         ("canyon", canyon),
         ("sea", sea),
         ("coast", coast),
+        // Placed where it rains, snows or storms when their turn comes.
+        ("rain", walk_on(start, 0.6)),
+        ("snowfall", walk_on(start, 1.4)),
+        ("storm", walk_on(start, 2.3)),
     ]
+}
+
+/// A low view (moved later), looking along `heading`, a little up.
+fn walk_on(start: &PlanetCamera, heading: f64) -> PlanetCamera {
+    let mut view = *start;
+    view.heading = heading;
+    view.pitch = 0.02;
+    view.mode = camera::CameraMode::Fly;
+    view
+}
+
+/// Views placed where the weather is doing something, when their turn comes.
+const WEATHER_VIEWS: [&str; 3] = ["rain", "snowfall", "storm"];
+
+/// A spot on land where the weather matches the view `name`, at time `t`.
+fn weather_spot(
+    name: &str,
+    weather: &Weather,
+    surface: &planet::surface::PlanetSurface,
+    t: f64,
+) -> Option<DVec3> {
+    use planet::weather::{rain_from_density, storm_from_density};
+    let n = 40_000;
+    (0..n)
+        .map(|i| {
+            // Fibonacci sphere.
+            let y = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+            let r = (1.0 - y * y).sqrt();
+            let a = i as f64 * 2.399_963;
+            DVec3::new(r * a.cos(), y, r * a.sin())
+        })
+        // In daylight, on land.
+        .filter(|&d| d.dot(SUN_DIRECTION.normalize().as_dvec3()) > 0.4)
+        .filter(|&d| (30.0..1_500.0).contains(&surface.height.sample(d)))
+        .map(|d| {
+            let v = weather.density(d, t);
+            let (rain, storm) = (rain_from_density(v), storm_from_density(v));
+            let temp = weather.temperature(d, surface.height.sample(d));
+            let score = match name {
+                "storm" if temp > 4.0 => storm,
+                "rain" if temp > 3.0 => rain * (1.0 - storm),
+                "snowfall" if temp < -3.0 => rain * (1.0 - 0.5 * storm),
+                _ => 0.0,
+            };
+            (score, d)
+        })
+        .filter(|(score, _)| *score > 0.5)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, d)| d)
 }
 
 /// Saves `<name>.png` once the planet is on screen. A loaded planet is ready before its
@@ -705,6 +794,8 @@ struct CaptureDone {
     retake: bool,
     /// The herd view has been moved next to a herd.
     herd_found: bool,
+    /// The weather view (by shot index) that has been placed.
+    weather_placed: Option<usize>,
     fields: Vec<(&'static str, FieldStats)>,
 }
 

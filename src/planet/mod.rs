@@ -8,6 +8,7 @@ pub mod ocean;
 pub mod sky;
 pub mod surface;
 pub mod vegetation;
+pub mod weather;
 
 use bevy::{
     light::NotShadowCaster,
@@ -349,8 +350,10 @@ impl Plugin for PlanetPlugin {
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<CloudMaterial>::default(),
             MaterialPlugin::<VegetationMaterial>::default(),
+            MaterialPlugin::<weather::PrecipitationMaterial>::default(),
         ))
         .init_resource::<Vegetation>()
+        .init_resource::<weather::Weather>()
         .init_resource::<fauna::Fauna>()
         .insert_resource(PlanetConfig {
             mesh_subdivisions: self.mesh_subdivisions,
@@ -358,7 +361,14 @@ impl Plugin for PlanetPlugin {
         })
         .insert_resource(TerrainLod::new(self.terrain))
         .insert_resource(PlanetCamera::new(radius))
-        .add_systems(Startup, (declare_simulation, sky::spawn_atmosphere))
+        .add_systems(
+            Startup,
+            (
+                declare_simulation,
+                sky::spawn_atmosphere,
+                weather::spawn_weather,
+            ),
+        )
         .add_systems(PostStartup, spawn_planet.after(SimAllocate))
         .add_systems(
             Update,
@@ -377,6 +387,8 @@ impl Plugin for PlanetPlugin {
                 swap_preview_for_terrain.after(lod::update_terrain),
                 sky::adapt_atmosphere.after(camera::clamp_camera),
                 ocean::update_waves.after(camera::clamp_camera),
+                weather::update_weather.after(camera::clamp_camera),
+                weather::apply_weather.after(weather::update_weather),
             ),
         );
     }
@@ -403,6 +415,7 @@ fn load_terrain_surface(
     vegetation_material: Option<Res<VegetationMaterialHandle>>,
     mut lod: ResMut<TerrainLod>,
     mut vegetation: ResMut<Vegetation>,
+    mut weather: ResMut<weather::Weather>,
     mut loaded: Local<u64>,
 ) {
     let (Some(material), Some(vegetation_material)) = (material, vegetation_material) else {
@@ -418,7 +431,7 @@ fn load_terrain_surface(
     };
     let surface = PlanetSurface {
         radius_m: TerrainParams::default().planet_radius_m as f64,
-        height: CubeField::new(baked.resolution, height),
+        height: CubeField::new(baked.resolution, height.clone()),
         detail: DetailParams {
             seed: control.seed,
             ..default()
@@ -432,6 +445,11 @@ fn load_terrain_surface(
         }),
     };
     info!("terrain: new planet surface (seed {})", baked.seed);
+    if let (Some(moisture), Some(temperature)) =
+        (baked.f32_field(MOISTURE), baked.f32_field(TEMPERATURE))
+    {
+        weather.set_planet(baked.resolution, moisture, temperature, height);
+    }
     lod.set_surface(&mut commands, surface, material.0.clone());
     match (baked.f32_field(BIOME), baked.f32_field(TEMPERATURE)) {
         (Some(biome), Some(temperature)) => vegetation.set_planet(

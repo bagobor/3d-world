@@ -16,7 +16,8 @@ import bevy_pbr::render::{
 import bevy_core_pipeline::tonemapping::tone_mapping;
 import bevy_pbr::render::mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT;
 import super::super::sim::common::{dir_to_face, dir_to_face_st, neighbor_texel, gradient_noise};
-import super::cloud_field::cloud_coverage;
+import super::cloud_field::{cloud_coverage, cloud_density, storm_from_density};
+import super::haze::with_haze;
 
 struct PlanetMaterialParams {
     planet_radius_m: f32,
@@ -363,10 +364,11 @@ struct Sea {
     crest: f32,
 }
 
-// Wave height relative to a calm sea: rougher under heavy cloud (storms).
+// Wave height relative to a calm sea: a little rougher under cloud, much rougher in storms.
 fn sea_state(dir: vec3<f32>) -> f32 {
-    let cover = cloud_coverage(dir, sample_field(MOISTURE, dir), globals.time);
-    return 0.7 + 1.9 * smoothstep(0.45, 0.95, cover);
+    let density = cloud_density(dir, sample_field(MOISTURE, dir), globals.time);
+    let cover = smoothstep(0.02, 0.32, density);
+    return 0.7 + 0.6 * cover + 1.8 * storm_from_density(density);
 }
 
 // Sum of Gerstner waves at camera-relative rest position `rest` with local vertical `up`.
@@ -513,5 +515,6 @@ fn shade(
     pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr.V = fns::calculate_view(world_position, pbr.is_orthographic);
 
-    return tone_mapping(fns::apply_pbr_lighting(pbr), view.color_grading);
+    let lit = with_haze(fns::apply_pbr_lighting(pbr), world_position.xyz, clip_position.xy);
+    return tone_mapping(lit, view.color_grading);
 }
