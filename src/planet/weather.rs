@@ -319,7 +319,9 @@ pub fn update_weather(mut weather: ResMut<Weather>, camera: Res<PlanetCamera>, t
     ) as f32;
     let v = weather.density(camera.dir, t);
     weather.cover = coverage_from_density(v) as f32;
-    weather.precipitation = rain_from_density(v) as f32 * below;
+    // Nothing falls on a diver.
+    let dry = if camera.altitude_m < 0.0 { 0.0 } else { 1.0 };
+    weather.precipitation = rain_from_density(v) as f32 * below * dry;
     weather.storm = storm_from_density(v) as f32 * below;
     weather.snow = weather.temperature(camera.dir, camera.altitude_m) < 0.5;
 
@@ -393,8 +395,11 @@ pub fn apply_weather(
             _pad: 0.0,
         };
     }
+    // Under water, light fades with depth.
+    let depth = (-camera.altitude_m).max(0.0) as f32;
     for mut sun in &mut suns {
-        let dim = 1.0 - 0.65 * weather.storm - 0.2 * weather.precipitation;
+        let dim =
+            (1.0 - 0.65 * weather.storm - 0.2 * weather.precipitation) * (-depth / 25.0).exp();
         sun.illuminance = bevy::light::light_consts::lux::DIRECT_SUNLIGHT * dim;
     }
     // A lightning flash lights everything at once, from the whole sky.
@@ -409,8 +414,15 @@ pub fn apply_weather(
             60_000.0 * (1.0 - heavy) + 3_000.0 * heavy
         };
         let grey = 0.55 - 0.3 * weather.storm;
-        fog.color = Color::srgba(grey, grey + 0.02, grey + 0.05, heavy.min(1.0));
-        fog.falloff = FogFalloff::from_visibility_squared(visibility);
+        if depth > 0.0 {
+            // Under water: blue-green murk, darker deeper, ~60 m visibility.
+            let k = (-depth / 40.0).exp();
+            fog.color = Color::srgba(0.04 * k, 0.24 * k, 0.30 * k, 1.0);
+            fog.falloff = FogFalloff::from_visibility_squared(60.0);
+        } else {
+            fog.color = Color::srgba(grey, grey + 0.02, grey + 0.05, heavy.min(1.0));
+            fog.falloff = FogFalloff::from_visibility_squared(visibility);
+        }
     }
 }
 

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use bevy::{
     asset::RenderAssetUsages,
+    light::NotShadowCaster,
     math::{DVec2, DVec3},
     mesh::{Indices, MeshVertexAttribute, PrimitiveTopology},
     platform::collections::HashMap,
@@ -22,7 +23,7 @@ use bevy::{
 };
 
 use super::{
-    TerrainMaterial,
+    SeaMaterial, TerrainMaterial,
     camera::PlanetCamera,
     mesh::FACE_AXES,
     surface::{PlanetSurface, face_st_to_dir},
@@ -86,6 +87,8 @@ impl NodeId {
 pub struct ChunkMesh {
     pub center: DVec3,
     pub mesh: Mesh,
+    /// Whether any of the chunk is below sea level (it then also gets a sea surface).
+    pub has_sea: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,8 +131,9 @@ pub fn build_chunk(node: NodeId, surface: &PlanetSurface, exaggeration: f64) -> 
             let st = min + DVec2::new(i as f64, j as f64) / n as f64 * size;
             let dir = face_st_to_dir(face, st);
             let h = surface.height(dir, min_wavelength);
-            // Oceans are flat at sea level; the material shades them by depth.
-            let r = surface.radius_m + h.max(0.0) * exaggeration;
+            // The seabed is meshed too; the sea surface is drawn over it from the same mesh
+            // (see `sea_vertex` in planet_material.wesl).
+            let r = surface.radius_m + h * exaggeration;
             points.push(dir * r);
             heights.push(h);
             dirs.push(dir);
@@ -154,9 +158,6 @@ pub fn build_chunk(node: NodeId, surface: &PlanetSurface, exaggeration: f64) -> 
                 .normalize_or(dir);
             if normal.dot(dir) < 0.0 {
                 normal = -normal;
-            }
-            if heights[k] < 0.0 {
-                normal = dir;
             }
             positions.push((points[k] - center).as_vec3().to_array());
             normals.push(normal.as_vec3().to_array());
@@ -184,7 +185,9 @@ pub fn build_chunk(node: NodeId, surface: &PlanetSurface, exaggeration: f64) -> 
         }
     }
 
-    // Skirts: each edge copied downwards, deep enough to cover a coarser neighbour.
+    // Skirts: each edge copied downwards, deep enough to cover a coarser neighbour. Their
+    // normals are stretched to 1 + the skirt depth, so the sea surface can fold them back up
+    // (the terrain normalizes normals anyway).
     let skirt = spacing * 1.5 + 20.0;
     let edges: [Vec<(i32, i32)>; 4] = [
         (0..=n).map(|i| (i, 0)).collect(),
@@ -198,7 +201,8 @@ pub fn build_chunk(node: NodeId, surface: &PlanetSurface, exaggeration: f64) -> 
             let k = at(i, j);
             let p = points[k] - dirs[k] * skirt;
             positions.push((p - center).as_vec3().to_array());
-            normals.push(normals[grid(i, j) as usize]);
+            let n = Vec3::from_array(normals[grid(i, j) as usize]);
+            normals.push((n * (1.0 + skirt as f32)).to_array());
             surf.push(surf[grid(i, j) as usize]);
         }
         for e in 0..edge.len() - 1 {
@@ -220,7 +224,11 @@ pub fn build_chunk(node: NodeId, surface: &PlanetSurface, exaggeration: f64) -> 
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(ATTRIBUTE_SURFACE, surf)
     .with_inserted_indices(Indices::U32(indices));
-    ChunkMesh { center, mesh }
+    ChunkMesh {
+        center,
+        mesh,
+        has_sea: heights.iter().any(|&h| h < 0.0),
+    }
 }
 
 /// A built chunk in the world.
@@ -240,6 +248,7 @@ pub struct TerrainLod {
     pub settings: LodSettings,
     surface: Option<Arc<PlanetSurface>>,
     material: Option<Handle<TerrainMaterial>>,
+    sea_material: Option<Handle<SeaMaterial>>,
     built: HashMap<NodeId, Built>,
     tasks: HashMap<NodeId, Task<ChunkMesh>>,
     frame: u64,
@@ -280,6 +289,7 @@ impl TerrainLod {
         commands: &mut Commands,
         surface: PlanetSurface,
         material: Handle<TerrainMaterial>,
+        sea_material: Handle<SeaMaterial>,
     ) {
         for (_, built) in self.built.drain() {
             commands.entity(built.entity).despawn();
@@ -287,6 +297,7 @@ impl TerrainLod {
         self.tasks.clear();
         self.surface = Some(Arc::new(surface));
         self.material = Some(material);
+        self.sea_material = Some(sea_material);
         self.drawn = 0;
         self.missing = 0;
     }
@@ -302,7 +313,11 @@ pub fn update_terrain(
     mut chunks: Query<&mut Visibility, With<TerrainChunk>>,
 ) {
     let lod = &mut *lod;
-    let (Some(surface), Some(material)) = (lod.surface.clone(), lod.material.clone()) else {
+    let (Some(surface), Some(material), Some(sea_material)) = (
+        lod.surface.clone(),
+        lod.material.clone(),
+        lod.sea_material.clone(),
+    ) else {
         return;
     };
     lod.frame += 1;
@@ -313,18 +328,28 @@ pub fn update_terrain(
         .iter_mut()
         .filter_map(|(id, task)| block_on(poll_once(task)).map(|chunk| (*id, chunk)))
         .map(|(id, chunk)| {
-            let entity = commands
-                .spawn((
-                    Name::new(format!("Terrain {id:?}")),
-                    Mesh3d(meshes.add(chunk.mesh)),
-                    MeshMaterial3d(material.clone()),
+            let mesh = meshes.add(chunk.mesh);
+            let mut entity = commands.spawn((
+                Name::new(format!("Terrain {id:?}")),
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::default(),
+                Visibility::Hidden,
+                TerrainChunk {
+                    center: chunk.center,
+                },
+            ));
+            if chunk.has_sea {
+                // The sea surface: the same mesh, flattened to sea level by its material.
+                entity.with_child((
+                    Name::new("Sea"),
+                    Mesh3d(mesh),
+                    MeshMaterial3d(sea_material.clone()),
                     Transform::default(),
-                    Visibility::Hidden,
-                    TerrainChunk {
-                        center: chunk.center,
-                    },
-                ))
-                .id();
+                    NotShadowCaster,
+                ));
+            }
+            let entity = entity.id();
             lod.built.insert(
                 id,
                 Built {

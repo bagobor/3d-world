@@ -36,6 +36,7 @@ use planet_sim::{
         camera::PlanetCamera,
         fauna::{Fauna, Species},
         lod::{LodSettings, TerrainLod},
+        marine::Marine,
         vegetation::Vegetation,
         weather::Weather,
     },
@@ -123,7 +124,7 @@ impl Args {
                          [--cache DIR | --no-cache] [--regenerate] \
                          [--resolution N] [--seed N] [--out DIR] \
                          [--yaw RAD] [--pitch RAD] [--distance RADII] [--exaggeration X] \\
-                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon,sea,coast,rain,snowfall,storm] [--no-shadows]"
+                         [--views planet,orbit,surface,forest,meadow,fly,walk,herd,peaks,canyon,sea,coast,rain,snowfall,storm,reef,kelp] [--no-shadows]"
                     );
                     std::process::exit(0);
                 }
@@ -351,7 +352,7 @@ fn headless_capture(
     mut wait: Local<u32>,
     done: Option<ResMut<CaptureDone>>,
     mut exit: MessageWriter<AppExit>,
-    (weather, mut virtual_time): (Res<Weather>, ResMut<Time<Virtual>>),
+    (weather, mut virtual_time, marine): (Res<Weather>, ResMut<Time<Virtual>>, Res<Marine>),
 ) {
     *frames += 1;
     let Some(mut done) = done else {
@@ -444,6 +445,12 @@ fn headless_capture(
         let taken = done.taken;
         let shot = &mut done.shots[taken].1;
         match found {
+            Some(dir) if name == "reef" || name == "kelp" => {
+                // Diving, a few metres down, looking ahead and a little down.
+                shot.dir = dir;
+                shot.altitude_m = -3.5;
+                shot.pitch = -0.2;
+            }
             Some(dir) => {
                 shot.dir = dir;
                 shot.altitude_m = surface.height(dir, 1.0).max(0.0) + 25.0;
@@ -461,7 +468,7 @@ fn headless_capture(
     } else if !done.shooting && *wait > 5 && lod.settled() && vegetation.settled() && fauna_ready {
         info!(
             "headless: {name} view, {} chunks, {} vegetation tiles, {} grazers, {} predators, \
-             precipitation {:.2}{}, storm {:.2}",
+             precipitation {:.2}{}, storm {:.2}, {} fish, {} kelp/coral",
             lod.drawn(),
             vegetation.drawn(),
             fauna.count(Species::Grazer),
@@ -469,6 +476,8 @@ fn headless_capture(
             weather.precipitation,
             if weather.snow { " (snow)" } else { "" },
             weather.storm,
+            marine.fish_count(),
+            marine.static_count(),
         );
         done.shooting = true;
         take_screenshot(&mut commands, &target, &args, name);
@@ -689,6 +698,9 @@ fn shots(
         ("rain", walk_on(start, 0.6)),
         ("snowfall", walk_on(start, 1.4)),
         ("storm", walk_on(start, 2.3)),
+        // Diving over a coral reef and in a kelp forest.
+        ("reef", walk_on(start, 0.8)),
+        ("kelp", walk_on(start, 1.9)),
     ]
 }
 
@@ -702,7 +714,7 @@ fn walk_on(start: &PlanetCamera, heading: f64) -> PlanetCamera {
 }
 
 /// Views placed where the weather is doing something, when their turn comes.
-const WEATHER_VIEWS: [&str; 3] = ["rain", "snowfall", "storm"];
+const WEATHER_VIEWS: [&str; 5] = ["rain", "snowfall", "storm", "reef", "kelp"];
 
 /// A spot on land where the weather matches the view `name`, at time `t`.
 fn weather_spot(
@@ -723,7 +735,10 @@ fn weather_spot(
         })
         // In daylight, on land.
         .filter(|&d| d.dot(SUN_DIRECTION.normalize().as_dvec3()) > 0.4)
-        .filter(|&d| (30.0..1_500.0).contains(&surface.height.sample(d)))
+        .filter(|&d| match name {
+            "reef" | "kelp" => (-14.0..-8.0).contains(&surface.height(d, 5.0)),
+            _ => (30.0..1_500.0).contains(&surface.height.sample(d)),
+        })
         .map(|d| {
             let v = weather.density(d, t);
             let (rain, storm) = (rain_from_density(v), storm_from_density(v));
@@ -732,6 +747,9 @@ fn weather_spot(
                 "storm" if temp > 4.0 => storm,
                 "rain" if temp > 3.0 => rain * (1.0 - storm),
                 "snowfall" if temp < -3.0 => rain * (1.0 - 0.5 * storm),
+                // Calm, clear water.
+                "reef" if weather.temperature(d, 0.0) > 23.0 => 1.0 - rain,
+                "kelp" if (4.0..14.0).contains(&weather.temperature(d, 0.0)) => 1.0 - rain,
                 _ => 0.0,
             };
             (score, d)
