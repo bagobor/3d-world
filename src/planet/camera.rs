@@ -262,7 +262,13 @@ pub fn clamp_camera(mut camera: ResMut<PlanetCamera>, lod: Res<TerrainLod>) {
     } else {
         MIN_EYE_HEIGHT_M
     };
-    let min = camera.ground_m.max(0.0) + eye;
+    // Flying can dive below the sea, down to the seabed; the other modes stay on top.
+    let floor = if camera.mode == CameraMode::Fly {
+        camera.ground_m
+    } else {
+        camera.ground_m.max(0.0)
+    };
+    let min = floor + eye;
     let max = camera.radius_m * 20.0;
     if camera.altitude_m <= min {
         camera.vertical_speed = 0.0;

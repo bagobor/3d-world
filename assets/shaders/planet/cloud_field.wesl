@@ -68,9 +68,12 @@ fn sample_cloud_noise(tex: texture_2d_array<f32>, dir: vec3<f32>, resolution: f3
     return mix(mix(n00, n10, f.x), mix(n01, n11, f.x), f.y);
 }
 
-// Cloud cover at planet direction `dir_in`, with `moisture` sampled there. `detail` adds the
-// fine octaves (for the cloud shell itself; shadows don't need them).
-fn cloud_coverage(
+// Raw cloud density at planet direction `dir_in`, with `moisture` sampled there, before it
+// is mapped to coverage: above ~0.32 the sky is overcast, and the higher it goes the
+// thicker the cloud (rain, then storms). `detail` adds the fine octaves (for the cloud
+// shell itself; shadows and sea state don't need them). Mirrored on the CPU, with all
+// octaves, by `cloud_density` in src/planet/weather.rs.
+fn cloud_density(
     noise_tex: texture_2d_array<f32>,
     resolution: f32,
     dir_in: vec3<f32>,
@@ -88,6 +91,30 @@ fn cloud_coverage(
     let band = 0.25 * exp(-pow(lat / 9.0, 2.0))
         - 0.22 * exp(-pow((lat - 25.0) / 9.0, 2.0))
         + 0.12 * exp(-pow((lat - 55.0) / 12.0, 2.0));
-    let v = n + band + (moisture - 0.6) * 0.35;
+    return n + band + (moisture - 0.6) * 0.35;
+}
+
+fn coverage_from_density(v: f32) -> f32 {
     return smoothstep(0.02, 0.32, v);
+}
+
+// Rain falls from the thickest cloud, storms from the thickest of that.
+fn rain_from_density(v: f32) -> f32 {
+    return smoothstep(0.22, 0.38, v);
+}
+
+fn storm_from_density(v: f32) -> f32 {
+    return smoothstep(0.38, 0.55, v);
+}
+
+// Cloud cover (0..1); arguments as for `cloud_density`.
+fn cloud_coverage(
+    noise_tex: texture_2d_array<f32>,
+    resolution: f32,
+    dir_in: vec3<f32>,
+    moisture: f32,
+    time: f32,
+    detail: bool,
+) -> f32 {
+    return coverage_from_density(cloud_density(noise_tex, resolution, dir_in, moisture, time, detail));
 }

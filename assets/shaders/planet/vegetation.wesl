@@ -18,6 +18,7 @@ import super::vegetation_common::{
     TEMPERATURE, MOISTURE,
 };
 import super::cloud_field::cloud_coverage;
+import super::haze::with_haze;
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var cloud_noise_tex: texture_2d_array<f32>;
 
@@ -157,5 +158,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
     pbr.N = n;
     pbr.is_orthographic = view.clip_from_view[3].w == 1.0;
     pbr.V = fns::calculate_view(in.world_position, pbr.is_orthographic);
-    return tone_mapping(fns::apply_pbr_lighting(pbr), view.color_grading);
+    let lit = with_haze(fns::apply_pbr_lighting(pbr), in.world_position.xyz, in.clip_position.xy);
+    return tone_mapping(lit, view.color_grading);
 }

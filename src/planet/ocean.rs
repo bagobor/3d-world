@@ -9,7 +9,7 @@
 use bevy::{math::DVec3, prelude::*};
 use std::f64::consts::TAU;
 
-use super::{PlanetMaterialParams, TerrainMaterial, TerrainMaterialHandle, camera::PlanetCamera};
+use super::{PlanetMaterialParams, SeaMaterial, SeaMaterialHandle, camera::PlanetCamera};
 
 /// Number of Gerstner waves (must match `WAVE_COUNT` in `planet_material.wesl`).
 pub const WAVE_COUNT: usize = 8;
@@ -118,8 +118,8 @@ pub fn wave_uniforms(camera: &PlanetCamera, t: f64) -> ([Vec4; WAVE_COUNT], [Vec
 pub(crate) fn update_waves(
     camera: Res<PlanetCamera>,
     time: Res<Time>,
-    handle: Option<Res<TerrainMaterialHandle>>,
-    mut materials: ResMut<Assets<TerrainMaterial>>,
+    handle: Option<Res<SeaMaterialHandle>>,
+    mut materials: ResMut<Assets<SeaMaterial>>,
 ) {
     let Some(handle) = handle else {
         return;
